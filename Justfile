@@ -169,7 +169,8 @@ run:
 build-agent:
     @mkdir -p "{{agent_artifact_dir}}"
     @echo "Building native Linux agent artifact (Cargo profile: {{build_profile}})..."
-    @docker build --quiet --build-arg CARGO_PROFILE="{{build_profile}}" --file harbor_adapter/nanocodex.Dockerfile --target artifact --output type=local,dest="{{agent_artifact_dir}}" .
+    @build_sha=$(git rev-parse HEAD); \
+        docker build --quiet --build-arg CARGO_PROFILE="{{build_profile}}" --build-arg VERGEN_GIT_SHA="$build_sha" --file harbor_adapter/nanocodex.Dockerfile --target artifact --output type=local,dest="{{agent_artifact_dir}}" .
     @test -x "{{agent_artifact}}"
 
 # Daytona sandboxes are AMD64 even when Harbor is orchestrated from Apple
@@ -177,7 +178,8 @@ build-agent:
 build-agent-hosted:
     @mkdir -p "{{hosted_agent_artifact_dir}}"
     @echo "Building AMD64 Linux agent artifact for Daytona (Cargo profile: {{build_profile}})..."
-    @docker build --quiet --platform linux/amd64 --build-arg CARGO_PROFILE="{{build_profile}}" --file harbor_adapter/nanocodex.Dockerfile --target artifact --output type=local,dest="{{hosted_agent_artifact_dir}}" .
+    @build_sha=$(git rev-parse HEAD); \
+        docker build --quiet --platform linux/amd64 --build-arg CARGO_PROFILE="{{build_profile}}" --build-arg VERGEN_GIT_SHA="$build_sha" --file harbor_adapter/nanocodex.Dockerfile --target artifact --output type=local,dest="{{hosted_agent_artifact_dir}}" .
     @test -f "{{hosted_agent_artifact}}" && test -x "{{hosted_agent_artifact}}"
 
 # Download the CI-built static AMD64 agent used by Daytona and other hosted
