@@ -82,6 +82,7 @@ shlex = "2.0.1"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
+sse-stream = "0.2.4"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"

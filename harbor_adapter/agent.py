@@ -230,8 +230,20 @@ class NanocodexAgent(BaseInstalledAgent):
 
     async def _stage_agents_md(self, environment: BaseEnvironment) -> None:
         agents_md_path = getattr(self, "_agents_md_path", None)
-        if agents_md_path is None:
+        skills_dir = getattr(self, "skills_dir", None)
+        if agents_md_path is None and not skills_dir:
             return
+        if skills_dir:
+            result = await self.exec_as_agent(
+                environment,
+                f"test -d {shlex.quote(skills_dir)} && "
+                f"find {shlex.quote(skills_dir)} -name SKILL.md -type f "
+                "-print -quit | grep -q .",
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"task skills directory contains no SKILL.md: {skills_dir}"
+                )
         result = await self.exec_as_agent(
             environment,
             "test ! -e /app/AGENTS.md && test ! -e /app/AGENTS.override.md",
@@ -241,7 +253,22 @@ class NanocodexAgent(BaseInstalledAgent):
                 "context-parity eval refuses to replace an existing /app/AGENTS.md "
                 "or /app/AGENTS.override.md"
             )
-        await environment.upload_file(agents_md_path, self._REMOTE_AGENTS_MD)
+        if skills_dir:
+            sections = []
+            if agents_md_path is not None:
+                sections.append(agents_md_path.read_text(encoding="utf-8").rstrip())
+            sections.append(
+                "# Task-provided skills\n\n"
+                f"This task provides capability instructions under `{skills_dir}`. "
+                "Before using a capability they cover, discover the `SKILL.md` "
+                "files beneath that directory and read the relevant file completely."
+            )
+            with tempfile.TemporaryDirectory(prefix="nanocodex-context-") as directory:
+                combined = Path(directory) / "AGENTS.md"
+                combined.write_text("\n\n".join(sections) + "\n", encoding="utf-8")
+                await environment.upload_file(combined, self._REMOTE_AGENTS_MD)
+        else:
+            await environment.upload_file(agents_md_path, self._REMOTE_AGENTS_MD)
         await self.exec_as_root(environment, f"chmod 0444 {self._REMOTE_AGENTS_MD}")
 
     async def run(
@@ -303,7 +330,22 @@ class NanocodexAgent(BaseInstalledAgent):
             self._effort,
             "--web-search",
             str(self._web_search).lower(),
+            "--mcp-defaults",
+            "false",
         ]
+        for server in getattr(self, "mcp_servers", []):
+            if server.transport == "stdio":
+                arguments.extend(["--mcp-stdio", f"{server.name}={server.command}"])
+                for argument in server.args:
+                    arguments.extend(["--mcp-arg", f"{server.name}={argument}"])
+            elif server.transport == "sse":
+                arguments.extend(["--mcp-sse", f"{server.name}={server.url}"])
+            elif server.transport == "streamable-http":
+                arguments.extend(["--mcp", f"{server.name}={server.url}"])
+            else:
+                raise ValueError(
+                    f"unsupported Harbor MCP transport: {server.transport}"
+                )
         if getattr(self, "_turbo", False):
             arguments.append("--turbo")
         arguments.extend(["--", prompt])

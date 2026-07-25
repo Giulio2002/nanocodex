@@ -3,6 +3,7 @@
 mod catalog;
 mod client;
 mod config;
+mod legacy_sse;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -75,7 +76,7 @@ impl Mcp {
 }
 
 impl McpBuilder {
-    /// Adds a named stdio or Streamable HTTP MCP server.
+    /// Adds a named stdio, legacy SSE, or Streamable HTTP MCP server.
     #[must_use]
     pub fn server(mut self, name: impl Into<String>, server: McpServer) -> Self {
         let name = name.into();
@@ -340,7 +341,8 @@ fn validate_server(name: &str, server: &McpServer) -> Result<(), McpBuildError> 
     }
     let (field, value) = match &server.transport {
         config::McpTransport::Stdio { command, .. } => ("command", command.as_str()),
-        config::McpTransport::StreamableHttp { url, .. } => ("URL", url.as_str()),
+        config::McpTransport::LegacySse { url }
+        | config::McpTransport::StreamableHttp { url, .. } => ("URL", url.as_str()),
     };
     if value.trim().is_empty() {
         return Err(McpBuildError::EmptyField {

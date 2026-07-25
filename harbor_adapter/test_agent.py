@@ -128,15 +128,17 @@ class WebSearchContractTests(unittest.TestCase):
         agent._effort = "low"
 
         agent._web_search = True
+        arguments = agent._run_arguments("test prompt")
         self.assertEqual(
-            agent._run_arguments("test prompt")[-4:],
-            ["--web-search", "true", "--", "test prompt"],
+            arguments[arguments.index("--web-search") :][:2],
+            ["--web-search", "true"],
         )
 
         agent._web_search = False
+        arguments = agent._run_arguments("test prompt")
         self.assertEqual(
-            agent._run_arguments("test prompt")[-4:],
-            ["--web-search", "false", "--", "test prompt"],
+            arguments[arguments.index("--web-search") :][:2],
+            ["--web-search", "false"],
         )
 
     def test_run_arguments_protect_a_prompt_that_starts_with_a_hyphen(self) -> None:
@@ -162,6 +164,38 @@ class WebSearchContractTests(unittest.TestCase):
             ["--turbo", "--", "test prompt"],
         )
 
+    def test_run_arguments_register_task_mcp_servers_and_disable_defaults(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = "test-model"
+        agent._effort = "max"
+        agent._web_search = False
+        agent._turbo = True
+        agent.mcp_servers = [
+            SimpleNamespace(
+                name="playwright",
+                transport="sse",
+                url="http://playwright-mcp:3080/sse",
+                command=None,
+                args=[],
+            ),
+            SimpleNamespace(
+                name="local",
+                transport="stdio",
+                url=None,
+                command="node",
+                args=["server.js", "--quiet"],
+            ),
+        ]
+
+        arguments = agent._run_arguments("test prompt")
+
+        self.assertIn("--mcp-defaults", arguments)
+        self.assertEqual(arguments[arguments.index("--mcp-defaults") + 1], "false")
+        self.assertIn("playwright=http://playwright-mcp:3080/sse", arguments)
+        self.assertIn("local=node", arguments)
+        self.assertIn("local=server.js", arguments)
+        self.assertIn("local=--quiet", arguments)
+
     def test_terminal_bench_disables_web_search(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         config = yaml.safe_load(
@@ -169,6 +203,53 @@ class WebSearchContractTests(unittest.TestCase):
         )
 
         self.assertIs(config["agents"][0]["kwargs"]["web_search"], False)
+
+    def test_frontier_bench_runs_the_complete_pinned_release_with_turbo(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        config = yaml.safe_load(
+            (repository / "evals" / "frontier-bench-turbo-k5.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(config["n_attempts"], 5)
+        self.assertIs(config["agents"][0]["kwargs"]["turbo"], True)
+        self.assertIs(config["agents"][0]["kwargs"]["web_search"], False)
+        self.assertEqual(
+            config["datasets"],
+            [
+                {
+                    "name": "frontier-bench/frontier-bench",
+                    "ref": "sha256:63f363a191f0a0429fd1c5b318080616bab839473ce27e39f44868d327b03a89",
+                }
+            ],
+        )
+
+
+class TaskSkillsContractTests(unittest.TestCase):
+    def test_task_skills_are_exposed_through_workspace_instructions(self) -> None:
+        uploaded: dict[str, str] = {}
+
+        async def upload_file(source: Path, destination: str) -> None:
+            uploaded[destination] = source.read_text(encoding="utf-8")
+
+        agent = object.__new__(NanocodexAgent)
+        agent._agents_md_path = None
+        agent.skills_dir = "/app/project/.agents/skills"
+        agent.exec_as_agent = AsyncMock(return_value=SimpleNamespace(return_code=0))
+        agent.exec_as_root = AsyncMock()
+        environment = SimpleNamespace(upload_file=AsyncMock(side_effect=upload_file))
+
+        asyncio.run(agent._stage_agents_md(environment))
+
+        context = uploaded[agent._REMOTE_AGENTS_MD]
+        self.assertIn("Task-provided skills", context)
+        self.assertIn(agent.skills_dir, context)
+        self.assertIn("SKILL.md", context)
+        agent.exec_as_root.assert_awaited_once_with(
+            environment, "chmod 0444 /app/AGENTS.md"
+        )
+
 
 class ContextParityContractTests(unittest.TestCase):
     def test_history_eval_arms_use_the_same_context_files(self) -> None:

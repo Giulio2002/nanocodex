@@ -12,6 +12,7 @@ use rmcp::{
 };
 
 use crate::config::{McpServer, McpTransport};
+use crate::legacy_sse::LegacySseTransport;
 
 pub(crate) type Client = Arc<RunningService<RoleClient, ()>>;
 
@@ -38,6 +39,19 @@ pub(crate) async fn connect(server: &McpServer) -> Result<ConnectedServer, Strin
             }
             let transport = TokioChildProcess::new(command)
                 .map_err(|error| format!("failed to launch stdio transport: {error}"))?;
+            let client = tokio::time::timeout(server.startup_timeout, ().serve(transport))
+                .await
+                .map_err(|_| startup_timeout(server, "initialize"))?
+                .map_err(|error| format!("MCP initialize failed: {}", error_chain(&error)))?;
+            finish_startup(server, client).await
+        }
+        McpTransport::LegacySse { url } => {
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let transport =
+                tokio::time::timeout(server.startup_timeout, LegacySseTransport::connect(url))
+                    .await
+                    .map_err(|_| startup_timeout(server, "SSE endpoint discovery"))?
+                    .map_err(|error| format!("failed to connect legacy SSE transport: {error}"))?;
             let client = tokio::time::timeout(server.startup_timeout, ().serve(transport))
                 .await
                 .map_err(|_| startup_timeout(server, "initialize"))?

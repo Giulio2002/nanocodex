@@ -37,6 +37,10 @@ pub(crate) struct McpArgs {
     #[arg(long = "mcp", value_name = "NAME=URL")]
     http: Vec<NamedValue>,
 
+    /// Add a named legacy HTTP+SSE MCP server (`NAME=URL`). Repeatable.
+    #[arg(long = "mcp-sse", value_name = "NAME=URL")]
+    sse: Vec<NamedValue>,
+
     /// Add a named stdio MCP server executable (`NAME=COMMAND`). Repeatable.
     #[arg(long = "mcp-stdio", value_name = "NAME=COMMAND")]
     stdio: Vec<NamedValue>,
@@ -64,6 +68,7 @@ pub(crate) struct McpArgs {
 
 enum Transport {
     Http(String),
+    Sse(String),
     Stdio(String),
 }
 
@@ -97,6 +102,9 @@ impl McpArgs {
         let mut servers = BTreeMap::new();
         for endpoint in self.http {
             insert_server(&mut servers, endpoint, Transport::Http)?;
+        }
+        for endpoint in self.sse {
+            insert_server(&mut servers, endpoint, Transport::Sse)?;
         }
         for command in self.stdio {
             insert_server(&mut servers, command, Transport::Stdio)?;
@@ -155,6 +163,7 @@ impl McpArgs {
             let description = server.description;
             let mut configured = match server.transport {
                 Transport::Http(url) => McpServer::http(url),
+                Transport::Sse(url) => McpServer::sse(url),
                 Transport::Stdio(command) => McpServer::stdio(command).args(server.arguments),
             }
             .startup_timeout(startup_timeout)
@@ -255,6 +264,7 @@ mod tests {
         McpArgs {
             mcp_defaults: true,
             http: Vec::new(),
+            sse: Vec::new(),
             stdio: Vec::new(),
             arguments: Vec::new(),
             bearer_env: Vec::new(),
@@ -304,6 +314,18 @@ mod tests {
         }
 
         assert!(args.build().is_err());
+    }
+
+    #[test]
+    fn legacy_sse_server_builds() {
+        let mut args = args();
+        args.mcp_defaults = false;
+        args.sse.push(NamedValue {
+            name: "playwright".to_owned(),
+            value: "http://playwright-mcp:3080/sse".to_owned(),
+        });
+
+        assert!(args.build().unwrap().is_some());
     }
 
     #[test]

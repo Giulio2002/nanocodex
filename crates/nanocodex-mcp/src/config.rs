@@ -23,6 +23,9 @@ pub(crate) enum McpTransport {
         env: BTreeMap<String, String>,
         cwd: Option<PathBuf>,
     },
+    LegacySse {
+        url: String,
+    },
     StreamableHttp {
         url: String,
         bearer: Option<SecretSource>,
@@ -74,6 +77,20 @@ impl McpServer {
         }
     }
 
+    /// Creates a remote MCP server using the legacy HTTP+SSE transport.
+    #[must_use]
+    pub fn sse(url: impl Into<String>) -> Self {
+        Self {
+            transport: McpTransport::LegacySse { url: url.into() },
+            description: None,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            unsupported_option: None,
+        }
+    }
+
     #[must_use]
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
@@ -109,7 +126,9 @@ impl McpServer {
     pub fn arg(mut self, argument: impl Into<String>) -> Self {
         match &mut self.transport {
             McpTransport::Stdio { args, .. } => args.push(argument.into()),
-            McpTransport::StreamableHttp { .. } => self.unsupported_option = Some("arg"),
+            McpTransport::LegacySse { .. } | McpTransport::StreamableHttp { .. } => {
+                self.unsupported_option = Some("arg");
+            }
         }
         self
     }
@@ -121,7 +140,9 @@ impl McpServer {
             McpTransport::Stdio { args, .. } => {
                 args.extend(arguments.into_iter().map(Into::into));
             }
-            McpTransport::StreamableHttp { .. } => self.unsupported_option = Some("args"),
+            McpTransport::LegacySse { .. } | McpTransport::StreamableHttp { .. } => {
+                self.unsupported_option = Some("args");
+            }
         }
         self
     }
@@ -133,7 +154,9 @@ impl McpServer {
             McpTransport::Stdio { env, .. } => {
                 env.insert(name.into(), value.into());
             }
-            McpTransport::StreamableHttp { .. } => self.unsupported_option = Some("env"),
+            McpTransport::LegacySse { .. } | McpTransport::StreamableHttp { .. } => {
+                self.unsupported_option = Some("env");
+            }
         }
         self
     }
@@ -143,7 +166,9 @@ impl McpServer {
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         match &mut self.transport {
             McpTransport::Stdio { cwd: current, .. } => *current = Some(cwd.into()),
-            McpTransport::StreamableHttp { .. } => self.unsupported_option = Some("cwd"),
+            McpTransport::LegacySse { .. } | McpTransport::StreamableHttp { .. } => {
+                self.unsupported_option = Some("cwd");
+            }
         }
         self
     }
@@ -155,7 +180,9 @@ impl McpServer {
             McpTransport::StreamableHttp { bearer, .. } => {
                 *bearer = Some(SecretSource::Value(token.into()));
             }
-            McpTransport::Stdio { .. } => self.unsupported_option = Some("bearer_token"),
+            McpTransport::Stdio { .. } | McpTransport::LegacySse { .. } => {
+                self.unsupported_option = Some("bearer_token");
+            }
         }
         self
     }
@@ -167,7 +194,9 @@ impl McpServer {
             McpTransport::StreamableHttp { bearer, .. } => {
                 *bearer = Some(SecretSource::Environment(variable.into()));
             }
-            McpTransport::Stdio { .. } => self.unsupported_option = Some("bearer_token_env"),
+            McpTransport::Stdio { .. } | McpTransport::LegacySse { .. } => {
+                self.unsupported_option = Some("bearer_token_env");
+            }
         }
         self
     }
@@ -179,7 +208,9 @@ impl McpServer {
             McpTransport::StreamableHttp { headers, .. } => {
                 headers.insert(name.into(), SecretSource::Value(value.into()));
             }
-            McpTransport::Stdio { .. } => self.unsupported_option = Some("header"),
+            McpTransport::Stdio { .. } | McpTransport::LegacySse { .. } => {
+                self.unsupported_option = Some("header");
+            }
         }
         self
     }
@@ -191,7 +222,9 @@ impl McpServer {
             McpTransport::StreamableHttp { headers, .. } => {
                 headers.insert(name.into(), SecretSource::Environment(variable.into()));
             }
-            McpTransport::Stdio { .. } => self.unsupported_option = Some("header_env"),
+            McpTransport::Stdio { .. } | McpTransport::LegacySse { .. } => {
+                self.unsupported_option = Some("header_env");
+            }
         }
         self
     }

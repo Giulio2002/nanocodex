@@ -563,6 +563,17 @@ arm rather than rerunning the control unnecessarily. Compare score and failure
 classes alongside total model calls, child-task fan-out, token usage, latency,
 and cost. Do not tune against benchmark verifiers or change tasks between arms.
 
+After the full Terminal-Bench 2.1 turbo sweep, evaluate the same application
+policy on the complete official FrontierBench release through Harbor's Daytona
+environment. Keep Harbor responsible for its multi-container, GPU, task MCP,
+skill, artifact, and separate-verifier contracts; do not approximate those
+tasks in the native Nanoeval VM runner. First gate one ordinary task, one
+multi-container or task-context case, and one GPU task against the exact branch
+binary. Then run all 74 tasks at five attempts each for high-turbo,
+xhigh-turbo, and max-turbo. Preserve the canonical tasks and verifiers and
+retain exact Harbor results, ATIF trajectories, agent events, and verifier
+outputs for every attempt.
+
 ## Performance policy
 
 - Optimize representative retained API/JSONL traces and real turns, not type
