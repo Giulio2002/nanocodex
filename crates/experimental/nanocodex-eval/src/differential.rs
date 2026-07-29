@@ -4058,7 +4058,17 @@ fn validate_differential_profile(
     if !summary.comparable {
         return None;
     }
-    let expected = ["exec", "wait"];
+    let expected_nanocodex = ["exec", "wait"];
+    let expected_codex_code_mode = [
+        "exec",
+        "wait",
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+        "apply_patch",
+        "view_image",
+        "image_gen",
+    ];
     let nanocodex = summary.event_loop.nanocodex.as_ref()?;
     let codex = summary.event_loop.codex.as_ref()?;
     let base_matches = |arm: &ApiEventLoopArmSummary| {
@@ -4070,35 +4080,35 @@ fn validate_differential_profile(
         arm.initial_visible_tools
             .iter()
             .map(String::as_str)
-            .eq(expected)
+            .eq(expected_nanocodex)
     };
     let nanocodex_matches = base_matches(nanocodex) && code_mode_only_visible(nanocodex);
     let codex_matches = base_matches(codex)
         && match codex_tool_mode {
             CodexToolMode::CodeModeOnly => code_mode_only_visible(codex),
-            CodexToolMode::CodeMode => {
-                codex.initial_visible_tools.len() > expected.len()
-                    && expected.iter().all(|expected| {
-                        codex
-                            .initial_visible_tools
-                            .iter()
-                            .any(|tool| tool == expected)
-                    })
-            }
+            CodexToolMode::CodeMode => codex
+                .initial_visible_tools
+                .iter()
+                .map(String::as_str)
+                .eq(expected_codex_code_mode),
         };
     let model_input_matches = summary.event_loop.initial_input_text_sections_equal == Some(true)
         && summary
             .event_loop
             .initial_generation_input_text_sections_equal
             == Some(true);
-    let code_mode_catalog_matches = summary.event_loop.initial_code_mode_tool_names_equal
-        == Some(true)
-        && summary.event_loop.initial_code_mode_tool_definitions_equal == Some(true);
+    let code_mode_catalog_matches = match codex_tool_mode {
+        CodexToolMode::CodeModeOnly => {
+            summary.event_loop.initial_code_mode_tool_names_equal == Some(true)
+                && summary.event_loop.initial_code_mode_tool_definitions_equal == Some(true)
+        }
+        CodexToolMode::CodeMode => true,
+    };
     if nanocodex_matches && codex_matches && model_input_matches && code_mode_catalog_matches {
         return None;
     }
     Some(format!(
-        "expected Nanocodex Code Mode-only and stock Codex {} to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, identical initial input text, and identical nested Code Mode definitions; nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}], initial_input_text_equal={:?}, initial_generation_input_text_equal={:?}, nested_tool_names_equal={:?}, nested_tool_definitions_equal={:?}",
+        "expected Nanocodex Code Mode-only and stock Codex {} to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, the pinned visible-tool surfaces, and identical initial input text (plus identical nested definitions when both are Code Mode-only); nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}], initial_input_text_equal={:?}, initial_generation_input_text_equal={:?}, nested_tool_names_equal={:?}, nested_tool_definitions_equal={:?}",
         codex_tool_mode.as_str(),
         nanocodex.initial_model.as_deref().unwrap_or("unobserved"),
         nanocodex
@@ -6068,8 +6078,36 @@ mod tests {
             .codex
             .as_mut()
             .unwrap()
-            .initial_visible_tools
-            .insert(0, "exec_command".to_owned());
+            .initial_visible_tools = [
+            "exec",
+            "wait",
+            "exec_command",
+            "write_stdin",
+            "update_plan",
+            "apply_patch",
+            "view_image",
+            "image_gen",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        normal_code_mode
+            .event_loop
+            .codex
+            .as_mut()
+            .unwrap()
+            .initial_code_mode_tools = None;
+        normal_code_mode
+            .event_loop
+            .codex
+            .as_mut()
+            .unwrap()
+            .initial_code_mode_tool_definitions = None;
+        normal_code_mode
+            .event_loop
+            .initial_code_mode_tool_names_equal = None;
+        normal_code_mode
+            .event_loop
+            .initial_code_mode_tool_definitions_equal = None;
         assert!(
             validate_differential_profile(
                 &normal_code_mode,
