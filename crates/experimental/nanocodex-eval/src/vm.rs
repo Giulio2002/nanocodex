@@ -66,7 +66,6 @@ const GUEST_RUNTIME_BLOCK_ID: &str = "nanoeval-runtime";
 const GUEST_RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
 const GUEST_RUNTIME_MOUNT: &str = "/run/nanoeval";
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
-const VM_AGENT_SHELL: &str = "sh";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
 #[cfg(target_os = "linux")]
 const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
@@ -1213,10 +1212,7 @@ fn vm_attempt_inner(
         .web_search(host.web_search)
         .image_generation(true)
         .working_directory(environment.workspace.clone())
-        // The resident guest runtime and stock Codex both resolve the root
-        // account's shell inside the task image. Image preparation's detected
-        // shell is verifier-launch policy, not the agent runtime's shell.
-        .default_shell(VM_AGENT_SHELL)
+        .default_shell(environment.shell.as_str())
         .tool(vm.exec_command_tool())
         .tool(vm.write_stdin_tool())
         .tool(vm.apply_patch_tool())

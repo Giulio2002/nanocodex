@@ -2477,7 +2477,7 @@ fn validated_prepared_disk_record(path: &Path) -> Result<String, ImageError> {
         )));
     }
     validate_root_disk(path)?;
-    Ok(record.shell)
+    prepared_shell(path).map(str::to_owned)
 }
 
 fn record_prepared_disk(path: &Path) -> Result<String, ImageError> {
@@ -2597,13 +2597,43 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 
 fn prepared_shell(path: &Path) -> Result<&'static str, ImageError> {
     let mut reader = Reader::new(path)?;
-    if reader.exists("/bin/bash") {
+    let configured = reader
+        .read_file("/etc/passwd", 0, None)
+        .ok()
+        .and_then(|passwd| configured_root_shell(&passwd));
+    if let Some((shell, path)) = configured
+        && reader.exists(&path)
+    {
+        return Ok(shell);
+    }
+    if reader.exists("/bin/bash") || reader.exists("/usr/bin/bash") {
         Ok("bash")
     } else if reader.exists("/bin/sh") {
         Ok("sh")
     } else {
         Err(ImageError::MissingPreparedPath("/bin/sh"))
     }
+}
+
+fn configured_root_shell(passwd: &[u8]) -> Option<(&'static str, String)> {
+    passwd.split(|byte| *byte == b'\n').find_map(|entry| {
+        let mut fields = entry.split(|byte| *byte == b':');
+        fields.next()?;
+        fields.next()?;
+        if fields.next()? != b"0" {
+            return None;
+        }
+        fields.next()?;
+        fields.next()?;
+        fields.next()?;
+        let path = std::str::from_utf8(fields.next()?).ok()?;
+        let shell = match Path::new(path).file_name()?.to_str()? {
+            "bash" => "bash",
+            "sh" => "sh",
+            _ => return None,
+        };
+        Some((shell, path.to_owned()))
+    })
 }
 
 fn validate_ext4_disk(path: &Path) -> Result<(), ImageError> {
@@ -2654,9 +2684,10 @@ mod tests {
         ImageError, ImageRuntimeConfig, LayerRecord, ManifestSource, PulledImage, PulledLayer,
         Reader, ReferenceRecord, VmImageBuilder, append_normalized_context_entry, blob_path,
         build_cache_key, build_guest_bootstrap_script, cached_file_digest,
-        configure_firmware_library_path, disk_cache_key, docker_process_environment, output_tail,
-        prepare_copy_source_disk, prepare_flattened_disk, reference_cache_key,
-        resolver_configuration, valid_cached_blob, valid_cached_ext4_disk, write_cache_record,
+        configure_firmware_library_path, configured_root_shell, disk_cache_key,
+        docker_process_environment, output_tail, prepare_copy_source_disk, prepare_flattened_disk,
+        reference_cache_key, resolver_configuration, valid_cached_blob, valid_cached_ext4_disk,
+        write_cache_record,
     };
     use flate2::{Compression, write::GzEncoder};
     use tracing::{
@@ -2672,6 +2703,24 @@ mod tests {
     const FIXTURE_MANIFEST: &str =
         "sha256:56249d7a2f93306106f6d8bcdf6423afb73c1b747d874febcc778beee25cb8bb";
     static IMAGE_PREPARE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn configured_root_shell_uses_the_uid_zero_account() {
+        let passwd = b"service:x:1000:1000::/srv:/bin/bash\n\
+                       root:x:0:0:root:/root:/bin/sh\n";
+
+        assert_eq!(
+            configured_root_shell(passwd),
+            Some(("sh", "/bin/sh".to_owned()))
+        );
+    }
+
+    #[test]
+    fn configured_root_shell_ignores_unsupported_shells() {
+        let passwd = b"root:x:0:0:root:/root:/bin/ash\n";
+
+        assert_eq!(configured_root_shell(passwd), None);
+    }
 
     #[cfg(unix)]
     #[test]
