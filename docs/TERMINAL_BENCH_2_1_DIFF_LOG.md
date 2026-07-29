@@ -674,6 +674,43 @@ Snapshot: 2026-07-29 07:14 UTC.
   two-arm declared guest-memory sum is exactly 48 GiB; freed capacity is
   backfilled rather than reserved per sweep.
 
+## Exact-context parity and targeted repeats
+
+Snapshot: 2026-07-29 07:50 UTC.
+
+- Commit `139fa186` removes the irrelevant bundled-skills injection and makes
+  the six nested Code Mode tool names, order, descriptions, and schemas
+  identical. The first fresh smoke passed on both arms with equal outer
+  `[exec, wait]` catalogs and equal nested-definition hashes.
+- The 23-pair tool-catalog-parity cohort is retained at
+  `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-post-parity-139fa186-20260729T073207Z`.
+  It produced eight both-passed, three Nanocodex-only, two stock-only, and ten
+  neither-passed results. In the targeted repeats, Nanocodex/stock pass counts
+  were 1/0 across three `dna-insert` samples, 1/1 across two `extract-elf`
+  samples, 0/0 across three `pytorch-model-recovery` samples, and 0/1 across
+  three `raman-fitting` samples. The winner still changes across independent
+  samples; only `raman-fitting` retains a one-sample stock edge in this
+  cohort.
+- API-comparison schema v11 fingerprints every ordered initial `input_text`
+  section by item/content ordinal, role, tag, byte count, and SHA-256. Its
+  first smoke rejected the run rather than calling it matched: Nanocodex
+  advertised `bash` while stock Codex advertised and executed `/bin/sh`.
+  Inspecting upstream Codex confirmed it resolves the guest account shell from
+  `/etc/passwd`, not `$SHELL`. Nanocodex's resident VM tool runtime uses that
+  same guest shell, so the old `bash` context label was internally inaccurate.
+- Commit `2ba81983` makes the eval agent advertise the actual guest runtime
+  shell. The fresh retained smoke at
+  `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-context-2ba81983-20260729T074841Z`
+  passed both verifiers with no profile-validation error. Its base prompt,
+  permissions, environment/task text, outer tools, nested tool names, and
+  nested tool definitions all match in order by SHA-256.
+- Ten exact-context paired repeats are running at
+  `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-exact-context-2ba81983-20260729T074940Z`:
+  three each of `raman-fitting` and `pytorch-model-recovery`, and two each of
+  `dna-insert` and `extract-elf`. Their 20 isolated microVMs declare exactly
+  48 GiB. These results are the first samples eligible to attribute a stable
+  difference beyond initial prompt/tool/shell context.
+
 | # | Task | Nanocodex | stock Codex | First-sample classification |
 | ---: | --- | --- | --- | --- |
 | 1 | `adaptive-rejection-sampler` | pass; 314.1s; 316,327 tok; 11 gen/2 poll | pass; 363.2s; 447,126 tok; 14 gen/3 poll | both passed |
