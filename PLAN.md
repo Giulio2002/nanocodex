@@ -140,7 +140,9 @@ After that baseline:
 
 1. compare stock Codex in its normal Code Mode configuration against stock
    Codex forced to `code_mode_only`, holding model, effort, task, and repetition
-   constant;
+   constant; select the stock treatment explicitly with
+   `nanocodex eval diff --codex-tool-mode code-mode` or
+   `--codex-tool-mode code-mode-only`;
 2. determine whether direct model-visible tools outside Code Mode improve
    success, cost, latency, or robustness;
 3. implement that mixed tool exposure in Nanocodex only if the controlled stock
@@ -246,11 +248,15 @@ schema-v5 differ exposed both the first request drift and a one-turn outer-loop
 variance live while preserving exact API, ATIF, event, and verifier evidence.
 The first-sample medium-effort `code_mode_only` baseline is complete for all 89
 Terminal-Bench 2.1 tasks: Nanocodex scores 79/89 and stock Codex 67/89, before
-repetition-based confidence. API-comparison schema v10 now fingerprints every
-nested Code Mode definition. The current per-attempt VM adapter has sustained
-a 48 GiB work-conserving guest budget, but it is not yet the task-worker
-allocation described above, so no one-VM-per-task or final host-saturation
-claim is complete.
+repetition-based confidence. API-comparison schema v11 now fingerprints every
+initial model-input text section and nested Code Mode definition. A fresh
+`2ba81983` smoke proves ordered SHA-256 equality for the base prompt,
+permissions, environment/task context, outer tools, and nested definitions.
+The current per-attempt VM adapter has sustained a 48 GiB work-conserving guest
+budget, but it is not yet the task-worker allocation described above, so no
+one-VM-per-task or final host-saturation claim is complete. The typed
+`CodexToolMode` policy and `--codex-tool-mode` CLI selector are implemented;
+the controlled normal-Code-Mode cohort remains pending.
 
 ## Current execution order
 

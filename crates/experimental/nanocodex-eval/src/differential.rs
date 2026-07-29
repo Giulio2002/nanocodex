@@ -31,10 +31,10 @@ use uuid::Uuid;
 use crate::{
     AgentResult, AtifBuilder, AtifSource, AtifStep, AtifToolCall, AtifTrajectory, AttemptAgent,
     CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
-    EvalAttempt, EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalExceptionKind,
-    EvalOutcome, EvalStatus, Evaluator, EvaluatorBuilder, MeasurementCompleteness,
-    ResponsesCaptureProxy, ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride, Task,
-    UsageTotals, project_codex_atif,
+    CodexToolMode, EvalAttempt, EvalAttemptOutcome, EvalEventKind, EvalEventStream,
+    EvalExceptionKind, EvalOutcome, EvalStatus, Evaluator, EvaluatorBuilder,
+    MeasurementCompleteness, ResponsesCaptureProxy, ResponsesCaptureProxyConfig,
+    ResponsesModelCatalogOverride, Task, UsageTotals, project_codex_atif,
     vm::{
         SharedDirectory, VmAttempt, VmAttemptError, VmBackend, VmCommand, VmEnvironment,
         VmResources, VmToolSessionError, VmToolSessionHandle, reflink_or_sparse_copy,
@@ -106,7 +106,7 @@ where
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/eval-diff";
 const COMPARISON_FILE: &str = "comparison.json";
-const COMPARISON_SCHEMA_VERSION: u32 = 5;
+const COMPARISON_SCHEMA_VERSION: u32 = 6;
 const PROGRESS_FILE: &str = "progress.jsonl";
 const PROGRESS_SCHEMA_VERSION: u32 = 1;
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -159,6 +159,7 @@ pub struct DifferentialEval {
     output: PathBuf,
     thinking: Thinking,
     web_search: bool,
+    codex_tool_mode: CodexToolMode,
     nanocodex_build: ExecutableIdentity,
 }
 
@@ -171,6 +172,7 @@ pub struct DifferentialEvalBuilder {
     output: PathBuf,
     thinking: Thinking,
     web_search: bool,
+    codex_tool_mode: CodexToolMode,
     nanocodex_build: Option<ExecutableIdentity>,
 }
 
@@ -335,10 +337,11 @@ struct ComparisonPolicy {
     codex_ephemeral: bool,
     codex_approval_policy: &'static str,
     codex_sandbox: &'static str,
-    tool_mode: &'static str,
+    nanocodex_tool_mode: &'static str,
+    codex_tool_mode: &'static str,
     multi_agent: &'static str,
     reasoning_summary: &'static str,
-    expected_visible_tools: [&'static str; 2],
+    expected_nanocodex_visible_tools: [&'static str; 2],
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1676,9 +1679,9 @@ impl DiffVmResources {
         version: Arc<OnceLock<String>>,
         progress: DiffProgress,
     ) -> InternalResult<AttemptAgent, VmAttemptError> {
-        let model_catalog_override = codex
-            .code_mode_only_model()
-            .map(ResponsesModelCatalogOverride::code_mode_only);
+        let model_catalog_override = codex.model_tool_mode().map(|(model, tool_mode)| {
+            ResponsesModelCatalogOverride::tool_mode(model, tool_mode.as_str())
+        });
         let session = runtime.session_handle()?;
         let runner = DiffVmCodexRunner::new(
             session,
@@ -2326,6 +2329,7 @@ impl DifferentialEval {
             output: PathBuf::from(DEFAULT_OUTPUT_DIRECTORY),
             thinking: Thinking::Medium,
             web_search: false,
+            codex_tool_mode: CodexToolMode::CodeModeOnly,
             nanocodex_build: None,
         }
     }
@@ -2354,6 +2358,7 @@ impl DifferentialEval {
             output,
             thinking,
             web_search,
+            codex_tool_mode,
             mut nanocodex_build,
         } = self;
         let started_at = Utc::now();
@@ -2409,7 +2414,7 @@ impl DifferentialEval {
         );
         let codex = CodexExec::new(&codex_path, MODEL, thinking.as_str())?
             .web_search(web_search)
-            .code_mode_only();
+            .tool_mode(codex_tool_mode);
 
         let nanocodex_evaluator = Evaluator::builder(nanocodex.clone())
             .output_directory(comparison_directory.join("nanocodex"))
@@ -2468,8 +2473,12 @@ impl DifferentialEval {
                     Some(format!("{error:#}")),
                 ),
             };
-        let profile_validation_error =
-            validate_matched_code_mode_only_profile(&api_comparison, MODEL, thinking.as_str());
+        let profile_validation_error = validate_differential_profile(
+            &api_comparison,
+            MODEL,
+            thinking.as_str(),
+            codex_tool_mode,
+        );
         progress.emit("runner", "comparison.completed", classification.as_str());
         let progress_error = progress_recorder
             .finish(progress)
@@ -2495,10 +2504,11 @@ impl DifferentialEval {
                 codex_ephemeral: true,
                 codex_approval_policy: "never",
                 codex_sandbox: "danger_full_access",
-                tool_mode: "code_mode_only",
+                nanocodex_tool_mode: "code_mode_only",
+                codex_tool_mode: codex_tool_mode.as_str(),
                 multi_agent: "disabled",
                 reasoning_summary: "auto",
-                expected_visible_tools: ["exec", "wait"],
+                expected_nanocodex_visible_tools: ["exec", "wait"],
             },
             started_at,
             finished_at: Utc::now(),
@@ -2567,6 +2577,16 @@ impl DifferentialEvalBuilder {
         self
     }
 
+    /// Selects stock Codex's model-visible tool exposure.
+    ///
+    /// Nanocodex remains in Code Mode-only so normal Code Mode can be
+    /// evaluated as one deliberate stock-arm treatment.
+    #[must_use]
+    pub const fn codex_tool_mode(mut self, tool_mode: CodexToolMode) -> Self {
+        self.codex_tool_mode = tool_mode;
+        self
+    }
+
     /// Records the embedding Nanocodex executable used as the VMM entrypoint.
     #[must_use]
     pub fn nanocodex_executable(mut self, identity: ExecutableIdentity) -> Self {
@@ -2591,6 +2611,7 @@ impl DifferentialEvalBuilder {
             output: self.output,
             thinking: self.thinking,
             web_search: self.web_search,
+            codex_tool_mode: self.codex_tool_mode,
             nanocodex_build: self
                 .nanocodex_build
                 .ok_or(DifferentialBuildError::MissingNanocodexIdentity)?,
@@ -3662,14 +3683,17 @@ fn reanalyze_inner(path: &Path) -> InternalResult<DifferentialReanalysis> {
         .get("thinking")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    let profile_validation_error = api_summary.as_ref().and_then(|summary| {
+    let profile_validation_error = if let Some(summary) = api_summary.as_ref() {
+        let codex_tool_mode = retained_codex_tool_mode(&comparison)?;
         expected_model
             .as_deref()
             .zip(expected_effort.as_deref())
             .and_then(|(model, effort)| {
-                validate_matched_code_mode_only_profile(summary, model, effort)
+                validate_differential_profile(summary, model, effort, codex_tool_mode)
             })
-    });
+    } else {
+        None
+    };
 
     let comparison_object = comparison
         .as_object_mut()
@@ -4025,10 +4049,11 @@ fn retain_api_comparison(
     )
 }
 
-fn validate_matched_code_mode_only_profile(
+fn validate_differential_profile(
     summary: &ApiComparisonSummary,
     expected_model: &str,
     expected_effort: &str,
+    codex_tool_mode: CodexToolMode,
 ) -> Option<String> {
     if !summary.comparable {
         return None;
@@ -4036,18 +4061,31 @@ fn validate_matched_code_mode_only_profile(
     let expected = ["exec", "wait"];
     let nanocodex = summary.event_loop.nanocodex.as_ref()?;
     let codex = summary.event_loop.codex.as_ref()?;
-    let arm_matches = |arm: &ApiEventLoopArmSummary| {
+    let base_matches = |arm: &ApiEventLoopArmSummary| {
         arm.initial_model.as_deref() == Some(expected_model)
             && arm.initial_reasoning_effort.as_deref() == Some(expected_effort)
             && arm.initial_reasoning_summary.as_deref() == Some("auto")
-            && arm
-                .initial_visible_tools
-                .iter()
-                .map(String::as_str)
-                .eq(expected)
     };
-    let nanocodex_matches = arm_matches(nanocodex);
-    let codex_matches = arm_matches(codex);
+    let code_mode_only_visible = |arm: &ApiEventLoopArmSummary| {
+        arm.initial_visible_tools
+            .iter()
+            .map(String::as_str)
+            .eq(expected)
+    };
+    let nanocodex_matches = base_matches(nanocodex) && code_mode_only_visible(nanocodex);
+    let codex_matches = base_matches(codex)
+        && match codex_tool_mode {
+            CodexToolMode::CodeModeOnly => code_mode_only_visible(codex),
+            CodexToolMode::CodeMode => {
+                codex.initial_visible_tools.len() > expected.len()
+                    && expected.iter().all(|expected| {
+                        codex
+                            .initial_visible_tools
+                            .iter()
+                            .any(|tool| tool == expected)
+                    })
+            }
+        };
     let model_input_matches = summary.event_loop.initial_input_text_sections_equal == Some(true)
         && summary
             .event_loop
@@ -4060,7 +4098,8 @@ fn validate_matched_code_mode_only_profile(
         return None;
     }
     Some(format!(
-        "expected both first API requests to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, only [exec, wait], and identical initial input text plus nested Code Mode definitions for the pinned code_mode_only profile; nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}], initial_input_text_equal={:?}, initial_generation_input_text_equal={:?}, nested_tool_names_equal={:?}, nested_tool_definitions_equal={:?}",
+        "expected Nanocodex Code Mode-only and stock Codex {} to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, identical initial input text, and identical nested Code Mode definitions; nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}], initial_input_text_equal={:?}, initial_generation_input_text_equal={:?}, nested_tool_names_equal={:?}, nested_tool_definitions_equal={:?}",
+        codex_tool_mode.as_str(),
         nanocodex.initial_model.as_deref().unwrap_or("unobserved"),
         nanocodex
             .initial_reasoning_effort
@@ -4088,6 +4127,22 @@ fn validate_matched_code_mode_only_profile(
         summary.event_loop.initial_code_mode_tool_names_equal,
         summary.event_loop.initial_code_mode_tool_definitions_equal,
     ))
+}
+
+fn retained_codex_tool_mode(comparison: &serde_json::Value) -> InternalResult<CodexToolMode> {
+    match comparison
+        .pointer("/policy/codex_tool_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("code_mode") => Ok(CodexToolMode::CodeMode),
+        Some("code_mode_only") => Ok(CodexToolMode::CodeModeOnly),
+        Some(tool_mode) => Err(diff_error!(
+            "retained comparison has unsupported stock Codex tool mode {tool_mode:?}"
+        )),
+        None => Err(diff_error!(
+            "retained comparison has no /policy/codex_tool_mode"
+        )),
+    }
 }
 
 fn compare_api_exchanges(
@@ -5441,14 +5496,15 @@ mod tests {
 
     use super::{
         ApiEventLoopTailSummary, ApiRequestPayload, ApiTokenUsageSummary, ArmStatus, CodexExec,
-        CodexVersion, DIFF_CODEX_CA_BUNDLE_FILENAME, DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME,
-        DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT, DiffCodexCaSource, DiffProgress, Evaluator,
-        LaneProgressState, ShellPollingSummary, Task, TrajectoryProjection, build_event_loop_trace,
-        compare_api_exchanges, detected_code_mode_empty_stdin_calls, detected_polling_turn,
-        diff_json, event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
+        CodexToolMode, CodexVersion, DIFF_CODEX_CA_BUNDLE_FILENAME,
+        DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME, DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
+        DiffCodexCaSource, DiffProgress, Evaluator, LaneProgressState, ShellPollingSummary, Task,
+        TrajectoryProjection, build_event_loop_trace, compare_api_exchanges,
+        detected_code_mode_empty_stdin_calls, detected_polling_turn, diff_json,
+        event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
         inspect_api_exchanges, newly_completed_lines, read_api_request_payloads,
         read_optional_codex_cloud_config_cache, reanalyze, run_arm, stage_diff_codex_ca_bundle,
-        validate_matched_code_mode_only_profile,
+        validate_differential_profile,
     };
 
     #[test]
@@ -5997,7 +6053,32 @@ mod tests {
                 .initial_visible_tools,
             ["exec", "wait"]
         );
-        assert!(validate_matched_code_mode_only_profile(&summary, "gpt-test", "medium").is_none());
+        assert!(
+            validate_differential_profile(
+                &summary,
+                "gpt-test",
+                "medium",
+                CodexToolMode::CodeModeOnly,
+            )
+            .is_none()
+        );
+        let mut normal_code_mode = summary.clone();
+        normal_code_mode
+            .event_loop
+            .codex
+            .as_mut()
+            .unwrap()
+            .initial_visible_tools
+            .insert(0, "exec_command".to_owned());
+        assert!(
+            validate_differential_profile(
+                &normal_code_mode,
+                "gpt-test",
+                "medium",
+                CodexToolMode::CodeMode,
+            )
+            .is_none()
+        );
         let mut mismatched_profile = summary.clone();
         mismatched_profile
             .event_loop
@@ -6006,8 +6087,13 @@ mod tests {
             .unwrap()
             .initial_reasoning_effort = Some("high".to_owned());
         assert!(
-            validate_matched_code_mode_only_profile(&mismatched_profile, "gpt-test", "medium")
-                .is_some()
+            validate_differential_profile(
+                &mismatched_profile,
+                "gpt-test",
+                "medium",
+                CodexToolMode::CodeModeOnly,
+            )
+            .is_some()
         );
         assert_eq!(
             summary

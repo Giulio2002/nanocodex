@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
 use nanocodex::Thinking;
 use nanocodex_eval::*;
@@ -15,6 +15,24 @@ use crate::{
 };
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/eval-diff";
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum StockCodexToolMode {
+    /// Expose normal tools directly as well as through Code Mode.
+    CodeMode,
+    /// Expose normal tools only through Code Mode's `exec` entrypoint.
+    #[default]
+    CodeModeOnly,
+}
+
+impl From<StockCodexToolMode> for CodexToolMode {
+    fn from(value: StockCodexToolMode) -> Self {
+        match value {
+            StockCodexToolMode::CodeMode => Self::CodeMode,
+            StockCodexToolMode::CodeModeOnly => Self::CodeModeOnly,
+        }
+    }
+}
 
 #[derive(Args)]
 pub(crate) struct Diff {
@@ -53,6 +71,10 @@ pub(crate) struct Diff {
         conflicts_with = "reanalyze"
     )]
     codex_bin: Option<PathBuf>,
+
+    /// Stock Codex tool exposure used by this controlled comparison.
+    #[arg(long, value_enum, default_value = "code-mode-only")]
+    codex_tool_mode: StockCodexToolMode,
 
     /// Parent directory for paired evaluator artifacts.
     #[arg(long, default_value = DEFAULT_OUTPUT_DIRECTORY)]
@@ -130,6 +152,7 @@ impl Diff {
             .output_directory(self.output)
             .thinking(thinking)
             .web_search(web_search)
+            .codex_tool_mode(self.codex_tool_mode.into())
             .nanocodex_executable(
                 ExecutableIdentity::new(current_executable, env!("NANOCODEX_SEMVER_VERSION"))
                     .git_sha(env!("VERGEN_GIT_SHA"))

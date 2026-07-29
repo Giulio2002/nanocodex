@@ -91,7 +91,7 @@ pub use capture_proxy::{
 };
 pub use codex::{
     CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
-    CodexExecError, project_codex_atif,
+    CodexExecError, CodexToolMode, project_codex_atif,
 };
 pub use differential::{
     CodexAuth, DifferentialBuildError, DifferentialClassification, DifferentialError,

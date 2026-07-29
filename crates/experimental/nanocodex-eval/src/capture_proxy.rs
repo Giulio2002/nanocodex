@@ -69,12 +69,12 @@ pub struct ResponsesModelCatalogOverride {
 }
 
 impl ResponsesModelCatalogOverride {
-    /// Pins one model to Codex's Code Mode-only surface.
+    /// Pins one model to an explicit Codex tool-mode selector.
     #[must_use]
-    pub fn code_mode_only(model: impl Into<String>) -> Self {
+    pub fn tool_mode(model: impl Into<String>, tool_mode: impl Into<String>) -> Self {
         Self {
             model: model.into(),
-            tool_mode: "code_mode_only".to_owned(),
+            tool_mode: tool_mode.into(),
             multi_agent_version: Some("disabled".to_owned()),
         }
     }
@@ -1066,8 +1066,9 @@ mod tests {
             ResponsesCaptureProxyConfig {
                 upstream: format!("http://{upstream_address}"),
                 output: output.clone(),
-                model_catalog_override: Some(ResponsesModelCatalogOverride::code_mode_only(
+                model_catalog_override: Some(ResponsesModelCatalogOverride::tool_mode(
                     "gpt-test",
+                    "code_mode_only",
                 )),
             },
         )

@@ -53,10 +53,31 @@ pub struct CodexExec {
     model: String,
     effort: String,
     web_search: bool,
-    code_mode_only: bool,
+    tool_mode: Option<CodexToolMode>,
     api_base_url: Option<String>,
     auth: CodexAuth,
     command_runner: Option<Arc<dyn CodexCommandRunner>>,
+}
+
+/// Stock Codex's model-visible tool exposure for a controlled evaluation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexToolMode {
+    /// Expose normal tools directly as well as through Code Mode.
+    CodeMode,
+    /// Expose normal tools only through Code Mode's `exec` entrypoint.
+    CodeModeOnly,
+}
+
+impl CodexToolMode {
+    /// Returns Codex's `/models` tool-mode selector.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodeMode => "code_mode",
+            Self::CodeModeOnly => "code_mode_only",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -74,7 +95,7 @@ impl fmt::Debug for CodexExec {
             .field("model", &self.model)
             .field("effort", &self.effort)
             .field("web_search", &self.web_search)
-            .field("code_mode_only", &self.code_mode_only)
+            .field("tool_mode", &self.tool_mode)
             .field("api_base_url", &self.api_base_url)
             .field("auth", &"[redacted]")
             .field(
@@ -112,7 +133,7 @@ impl CodexExec {
             model: model.into(),
             effort: effort.into(),
             web_search: false,
-            code_mode_only: false,
+            tool_mode: None,
             api_base_url: None,
             auth: CodexAuth::Inherit,
             command_runner: None,
@@ -127,24 +148,23 @@ impl CodexExec {
         self
     }
 
-    /// Restricts stock Codex to the same model-visible Code Mode entrypoints
-    /// used by Nanocodex's evaluator profile.
+    /// Pins stock Codex's model-visible Code Mode exposure.
     ///
     /// The evaluator-owned capture proxy must also pin a remote `/models`
     /// selector because Codex intentionally gives that selector precedence
     /// over feature flags.
     #[doc(hidden)]
     #[must_use]
-    pub const fn code_mode_only(mut self) -> Self {
-        self.code_mode_only = true;
+    pub const fn tool_mode(mut self, tool_mode: CodexToolMode) -> Self {
+        self.tool_mode = Some(tool_mode);
         self
     }
 
-    /// Returns the model whose remote catalog selector must be pinned.
+    /// Returns the model and remote catalog selector that must be pinned.
     #[doc(hidden)]
     #[must_use]
-    pub fn code_mode_only_model(&self) -> Option<&str> {
-        self.code_mode_only.then_some(self.model.as_str())
+    pub fn model_tool_mode(&self) -> Option<(&str, CodexToolMode)> {
+        self.tool_mode.map(|mode| (self.model.as_str(), mode))
     }
 
     /// Routes stock Codex through one evaluator-owned OpenAI-compatible base
@@ -394,12 +414,15 @@ impl CodexExec {
                 format!("openai_base_url={}", toml_string(api_base_url)),
             ]);
         }
-        if self.code_mode_only {
+        if let Some(tool_mode) = self.tool_mode {
             arguments.extend([
                 "--config".to_owned(),
                 "features.code_mode=true".to_owned(),
                 "--config".to_owned(),
-                "features.code_mode_only=true".to_owned(),
+                format!(
+                    "features.code_mode_only={}",
+                    tool_mode == CodexToolMode::CodeModeOnly
+                ),
             ]);
         }
         arguments.extend(["--".to_owned(), prompt.to_owned()]);
@@ -1543,8 +1566,8 @@ mod tests {
 
     use super::{
         CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus,
-        CodexExec, CodexExecError, CodexRunError, CodexTranscript, EVENTS_FILE, STDERR_FILE,
-        SUMMARY_FILE, capture_stdout, project_codex_atif,
+        CodexExec, CodexExecError, CodexRunError, CodexToolMode, CodexTranscript, EVENTS_FILE,
+        STDERR_FILE, SUMMARY_FILE, capture_stdout, project_codex_atif,
     };
 
     #[derive(Default)]
@@ -1820,7 +1843,7 @@ mod tests {
         let codex = CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium")
             .unwrap()
             .web_search(true)
-            .code_mode_only()
+            .tool_mode(CodexToolMode::CodeModeOnly)
             .command_runner(runner.clone());
 
         let execution = codex
@@ -1877,7 +1900,10 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "model_reasoning_summary=\"auto\"")
         );
-        assert_eq!(codex.code_mode_only_model(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            codex.model_tool_mode(),
+            Some(("gpt-5.6-sol", CodexToolMode::CodeModeOnly))
+        );
         assert_eq!(
             arguments.last().map(String::as_str),
             Some("finish the benchmark")
@@ -1892,6 +1918,30 @@ mod tests {
             "guest diagnostic\n"
         );
         assert!(attempt.join(SUMMARY_FILE).is_file());
+    }
+
+    #[test]
+    fn normal_code_mode_explicitly_disables_code_mode_only() {
+        let codex = CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium")
+            .unwrap()
+            .tool_mode(CodexToolMode::CodeMode);
+
+        let arguments = codex.command_arguments("test");
+
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "features.code_mode=true")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "features.code_mode_only=false")
+        );
+        assert_eq!(
+            codex.model_tool_mode(),
+            Some(("gpt-5.6-sol", CodexToolMode::CodeMode))
+        );
     }
 
     #[tokio::test]
