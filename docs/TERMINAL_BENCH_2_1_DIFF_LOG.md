@@ -674,9 +674,9 @@ Snapshot: 2026-07-29 07:14 UTC.
   two-arm declared guest-memory sum is exactly 48 GiB; freed capacity is
   backfilled rather than reserved per sweep.
 
-## Exact-context parity and targeted repeats
+## Context-parity validation and targeted repeats
 
-Snapshot: 2026-07-29 07:50 UTC.
+Snapshot: 2026-07-29 08:05 UTC.
 
 - Commit `139fa186` removes the irrelevant bundled-skills injection and makes
   the six nested Code Mode tool names, order, descriptions, and schemas
@@ -698,18 +698,48 @@ Snapshot: 2026-07-29 07:50 UTC.
   Inspecting upstream Codex confirmed it resolves the guest account shell from
   `/etc/passwd`, not `$SHELL`. Nanocodex's resident VM tool runtime uses that
   same guest shell, so the old `bash` context label was internally inaccurate.
-- Commit `2ba81983` makes the eval agent advertise the actual guest runtime
-  shell. The fresh retained smoke at
+- Commit `2ba81983` replaced the image builder's `bash` preference with a
+  fixed `sh` model-context label. The fresh Alpine-based smoke at
   `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-context-2ba81983-20260729T074841Z`
   passed both verifiers with no profile-validation error. Its base prompt,
   permissions, environment/task text, outer tools, nested tool names, and
-  nested tool definitions all match in order by SHA-256.
-- Ten exact-context paired repeats are running at
+  nested tool definitions all match in order by SHA-256. This established
+  parity for that image, not a globally valid shell policy.
+- Ten intended exact-context paired repeats completed at
   `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-exact-context-2ba81983-20260729T074940Z`:
   three each of `raman-fitting` and `pytorch-model-recovery`, and two each of
-  `dna-insert` and `extract-elf`. Their 20 isolated microVMs declare exactly
-  48 GiB. These results are the first samples eligible to attribute a stable
-  difference beyond initial prompt/tool/shell context.
+  `dna-insert` and `extract-elf`. Nanocodex passed 3/10 and stock Codex passed
+  2/10: two Nanocodex-only `extract-elf` attempts, one Nanocodex-only
+  `raman-fitting` attempt, two stock-only `dna-insert` attempts, and five
+  shared failures. All ten were rejected by the schema-v11 profile guard
+  because their Ubuntu-family task images made stock Codex advertise `bash`
+  while Nanocodex advertised the fixed `sh`. The results remain useful
+  strategy evidence, but are not exact-context samples.
+- The two `dna-insert` trajectories identify the same non-loop failure.
+  Nanocodex chose the reconstructible insertion boundary at offset 215, where
+  repeated `AG` bases make the insertion appear as
+  `TAGATT...AGAAAG`. Stock Codex enumerated every reconstructible boundary
+  and chose the verifier's canonical offset 213,
+  `AGTAGATT...AGAA`. Nanocodex's local `oligotm` checks therefore measured
+  annealing arms different from the verifier's inferred arms and missed the
+  paired-Tm limit both times. Both response chains and tool-result links were
+  healthy; neither arm polled.
+- A normal-Code-Mode smoke at
+  `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-stock-code-mode-smoke-3d250ff5-20260729T075624Z`
+  passed both verifiers. It confirms stock Codex exposes
+  `[exec, wait, exec_command, write_stdin, update_plan, apply_patch,
+  view_image, image_gen]` and actually selects direct tools, while Nanocodex
+  remains the Code-Mode-Only control. The guard correctly rejected this smoke
+  only because of the same task-image shell mismatch; the treatment tool
+  surface itself matched the requested normal-Code-Mode policy.
+- Commit `2880af1f` fixes the root cause generically. Prepared VM images now
+  derive the UID-0 account's supported shell from `/etc/passwd`, matching
+  stock Codex's upstream shell selection, and cached images re-derive the
+  value instead of trusting stale shell metadata. The eval agent uses that
+  per-image value for model context while the resident guest runtime continues
+  to execute against the same account. Exact Code-Mode-Only and normal-Code-
+  Mode smokes must pass the schema-v11 guard on both Alpine and Ubuntu-family
+  images before the controlled treatment cohort starts.
 
 | # | Task | Nanocodex | stock Codex | First-sample classification |
 | ---: | --- | --- | --- | --- |
