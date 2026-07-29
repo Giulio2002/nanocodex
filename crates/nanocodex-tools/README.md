@@ -135,7 +135,9 @@ tool implementation or an alternate mode for normal native applications.
 
 The crate root intentionally contains only the normal registry path:
 [`Tools`], `ToolsBuilder`, `ToolsBuildError`, [`Tool`], `tool`, and the
-types required by the `Tool` methods.
+types required by the `Tool` methods, plus
+[`ambient_sensitive_environment`](crate::ambient_sensitive_environment) for
+deliberately restoring proxy-safe credential markers to tool subprocesses.
 
 - [`contract`] contains complete model-visible inputs, outputs, errors, and
   retained wire forms.

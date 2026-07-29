@@ -373,6 +373,36 @@ fn normalize_environment(environment: &mut Vec<(OsString, OsString)>) {
     }
 }
 
+/// Returns the ambient environment variables the shell tool withholds from tool
+/// subprocesses because their names look sensitive.
+///
+/// Pass the result to
+/// [`ToolsBuilder::process_environment`](crate::ToolsBuilder::process_environment)
+/// when the embedder's tools legitimately need them. That is the case behind a
+/// credential-injecting proxy, where the variable holds a marker the proxy
+/// substitutes at the network boundary rather than a secret — a tool that cannot
+/// send the marker cannot authenticate at all, so withholding it only breaks the
+/// tool. Forwarded UTF-8 values of at least eight bytes still join the existing
+/// redaction list, so they stay masked in tool output.
+///
+/// Selecting by name is deliberate: forwarding the whole ambient environment
+/// would also override the shell normalization (`TERM`, `PAGER`, `NO_COLOR`, ...)
+/// that keeps tool output machine-readable.
+///
+/// # Security
+///
+/// This function selects variables by name and cannot distinguish proxy-safe
+/// markers from real secrets. Passing its result to a tool runtime grants every
+/// tool subprocess access to every returned value. Only use it when the embedding
+/// boundary deliberately permits that access.
+#[cfg(feature = "native")]
+#[must_use]
+pub fn ambient_sensitive_environment() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(name, _)| is_sensitive_name(name))
+        .collect()
+}
+
 fn is_sensitive_name(name: &OsStr) -> bool {
     name.to_string_lossy()
         .to_ascii_uppercase()
@@ -384,7 +414,42 @@ fn is_sensitive_name(name: &OsStr) -> bool {
 mod tests {
     use std::ffi::OsString;
 
+    #[cfg(feature = "native")]
+    use std::collections::BTreeSet;
+
+    #[cfg(feature = "native")]
+    use super::ambient_sensitive_environment;
     use super::{NORMALIZED_ENVIRONMENT, normalize_environment, sanitized_environment};
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn ambient_sensitive_environment_partitions_the_ambient_environment() {
+        let forwarded: BTreeSet<_> = ambient_sensitive_environment()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let (kept, _) = sanitized_environment(&[]);
+        let kept: BTreeSet<_> = kept.into_iter().map(|(name, _)| name).collect();
+
+        // The contract an embedder relies on: forwarding this set restores what
+        // the child lost and nothing else, so the two sets partition the ambient
+        // environment.
+        assert!(kept.is_disjoint(&forwarded));
+        for name in std::env::vars_os().map(|(name, _)| name) {
+            assert!(
+                kept.contains(&name) || forwarded.contains(&name),
+                "{name:?} is neither kept nor forwarded"
+            );
+        }
+        for name in &forwarded {
+            assert!(
+                !NORMALIZED_ENVIRONMENT
+                    .iter()
+                    .any(|(normalized, _)| name == normalized),
+                "{name:?} would override the shell normalization"
+            );
+        }
+    }
 
     #[test]
     fn normalized_environment_overrides_terminal_and_pager_values() {

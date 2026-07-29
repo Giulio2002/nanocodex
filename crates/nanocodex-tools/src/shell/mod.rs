@@ -5,6 +5,8 @@ mod tool;
 
 #[cfg(feature = "native")]
 pub(crate) use process::ProcessGroupGuard;
+#[cfg(feature = "native")]
+pub use process::ambient_sensitive_environment;
 pub(crate) use tool::{ExecCommandHandler, WriteStdinHandler};
 
 use std::{

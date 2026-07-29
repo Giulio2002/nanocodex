@@ -102,6 +102,9 @@ pub(crate) use runtime::{DynamicToolProvider, ImageGenerationConfig, WebSearchCo
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub use runtime::{ToolsBuildError, ToolsBuilder};
+#[cfg(all(not(target_family = "wasm"), feature = "native"))]
+#[cfg_attr(docsrs, doc(cfg(all(not(target_family = "wasm"), feature = "native"))))]
+pub use shell::ambient_sensitive_environment;
 #[cfg(all(not(target_family = "wasm"), feature = "workspace-runtime"))]
 pub(crate) use standard::StandardTool;
 
