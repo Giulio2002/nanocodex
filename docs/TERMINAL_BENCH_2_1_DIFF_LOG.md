@@ -139,6 +139,129 @@ exactly. This metadata check does not make Harbor part of task execution.
   VMs declare 22 vCPUs and 48 GiB total guest memory. Output:
   `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-wave5-20260729T0544Z`.
 
+## Fifth-wave rolling results
+
+Snapshot: 2026-07-29 06:11 UTC.
+
+- The fifth-wave scheduler admits work by the sum of both task-declared VM
+  memory limits, keeping no more than 48 GiB live on the 62 GiB host. A pair
+  still uses two isolated microVMs, but warm image/runtime caches are shared
+  and freed capacity is backfilled immediately. This has kept 10–11 pairs
+  active together rather than assigning one mostly empty VM to an entire sweep
+  configuration.
+- The first 34 unique fifth-wave pairs below are complete. Twenty-nine pass on
+  both arms and five score for Nanocodex only. The
+  `feal-differential-cryptanalysis` split is a stock-Codex safety refusal, so it
+  is not included as a clean performance win. The other four splits have
+  verifier-backed trajectory diagnoses below.
+- API comparison schema v9 at PR #61 commit
+  `8e022610fa4789ce84001d14ee6c70512003ed5f` now separates direct
+  `previous_response_id` links, complete-history replays, replays immediately
+  following a nonterminal attempt, direct and replayed tool-result links, and
+  genuinely broken links. It also quantifies tokens and poll turns in either
+  arm's unpaired tail.
+- All 59 comparisons retained through this snapshot were
+  reanalyzed concurrently with schema v9 without running a model, VM, agent,
+  or verifier. There are zero broken response links and zero broken tool-result
+  links. Stock Codex performs three valid complete-history replays:
+  `reshard-c4-data` and `install-windows-3.11` after nonterminal Responses
+  attempts, and `fix-ocaml-gc` after a terminal boundary and WebSocket logical
+  timing reset. Nanocodex performs none in these samples.
+- The `reshard-c4-data` raw stream makes the reconnect case explicit. Stock
+  request 13 receives only `response.created` and `response.in_progress`.
+  Request 14 omits `previous_response_id`, replays 33 committed history items
+  including eight old call/result pairs, and then completes normally. Schema
+  v6 incorrectly called those eight results broken; schema v9 records one
+  replay after a nonterminal attempt, eight replayed result links, and zero
+  broken links.
+- Every pair still has a different nested Code Mode catalog even though the
+  top-level tools, model, effort, summary policy, web-search policy, and
+  Code Mode-only selection match. Results are therefore evidence about the
+  current implementations, not a claim of byte-identical model context.
+
+| Task | Nanocodex | stock Codex | Classification |
+| --- | --- | --- | --- |
+| `bn-fit-modify` | pass; 97.4s; 72,128 tok; 7 gen/0 poll | pass; 94.6s; 105,491 tok; 9 gen/0 poll | both passed |
+| `cancel-async-tasks` | pass; 63.5s; 38,599 tok; 5 gen/0 poll | pass; 87.6s; 40,362 tok; 4 gen/0 poll | both passed |
+| `chess-best-move` | pass; 51.5s; 80,502 tok; 8 gen/0 poll | pass; 193.7s; 212,364 tok; 18 gen/2 poll | both passed |
+| `circuit-fibsqrt` | pass; 252.5s; 129,940 tok; 10 gen/3 poll | pass; 203.2s; 184,569 tok; 12 gen/0 poll | both passed |
+| `code-from-image` | pass; 22.5s; 38,957 tok; 5 gen/0 poll | pass; 31.1s; 49,052 tok; 5 gen/0 poll | both passed |
+| `constraints-scheduling` | pass; 31.6s; 34,274 tok; 4 gen/0 poll | pass; 51.2s; 54,566 tok; 5 gen/0 poll | both passed |
+| `count-dataset-tokens` | pass; 126.6s; 176,605 tok; 13 gen/2 poll | pass; 152.3s; 387,134 tok; 17 gen/0 poll | both passed |
+| `db-wal-recovery` | pass; 80.1s; 68,359 tok; 8 gen/0 poll | pass; 230.5s; 164,488 tok; 13 gen/0 poll | both passed |
+| `distribution-search` | pass; 86.9s; 47,414 tok; 5 gen/0 poll | pass; 53.6s; 42,136 tok; 4 gen/0 poll | both passed |
+| `feal-differential-cryptanalysis` | pass; 127.4s; 57,893 tok; 6 gen/0 poll | safety refusal; 59.2s; no usage; 3 gen/0 poll | Nanocodex scored; stock lifecycle refused |
+| `feal-linear-cryptanalysis` | pass; 112.9s; 96,166 tok; 8 gen/0 poll | pass; 237.5s; 291,088 tok; 17 gen/0 poll | both passed |
+| `fix-code-vulnerability` | pass; 66.3s; 179,241 tok; 9 gen/0 poll | pass; 63.8s; 145,537 tok; 8 gen/0 poll | both passed |
+| `fix-git` | pass; 77.3s; 110,256 tok; 11 gen/0 poll | pass; 68.6s; 109,743 tok; 10 gen/0 poll | both passed |
+| `fix-ocaml-gc` | pass; 341.2s; 673,357 tok; 22 gen/6 poll | pass; 425.3s; 2,268,328 tok; 44 gen/13 poll | both passed |
+| `git-leak-recovery` | pass; 154.8s; 140,350 tok; 13 gen/0 poll | pass; 117.7s; 74,304 tok; 7 gen/0 poll | both passed |
+| `install-windows-3.11` | pass; 576.7s; 2,796,296 tok; 60 gen/3 poll | pass; 542.2s; 3,138,753 tok; 56 gen/11 poll | both passed |
+| `kv-store-grpc` | pass; 165.7s; 87,522 tok; 10 gen/1 poll | fail; 112.9s; 109,940 tok; 10 gen/1 poll | Nanocodex only passed |
+| `large-scale-text-editing` | pass; 78.8s; 31,536 tok; 4 gen/0 poll | pass; 74.6s; 48,728 tok; 5 gen/0 poll | both passed |
+| `log-summary-date-ranges` | pass; 31.9s; 46,423 tok; 5 gen/0 poll | fail; 77.3s; 56,641 tok; 5 gen/0 poll | Nanocodex only passed |
+| `modernize-scientific-stack` | pass; 39.4s; 34,043 tok; 4 gen/0 poll | pass; 37.1s; 52,912 tok; 5 gen/0 poll | both passed |
+| `mteb-leaderboard` | pass; 375.3s; 752,043 tok; 32 gen/4 poll | pass; 309.3s; 1,619,030 tok; 36 gen/0 poll | both passed |
+| `mteb-retrieve` | pass; 98.4s; 106,550 tok; 12 gen/1 poll | fail; 93.8s; 88,138 tok; 9 gen/0 poll | Nanocodex only passed |
+| `multi-source-data-merger` | pass; 55.9s; 36,302 tok; 4 gen/0 poll | pass; 89.1s; 41,680 tok; 4 gen/0 poll | both passed |
+| `nginx-request-logging` | pass; 70.8s; 79,794 tok; 8 gen/0 poll | pass; 66.0s; 84,748 tok; 7 gen/0 poll | both passed |
+| `openssl-selfsigned-cert` | pass; 65.4s; 51,778 tok; 6 gen/0 poll | pass; 76.6s; 78,890 tok; 7 gen/0 poll | both passed |
+| `polyglot-rust-c` | pass; 147.8s; 51,612 tok; 5 gen/0 poll | pass; 151.0s; 127,481 tok; 10 gen/0 poll | both passed |
+| `portfolio-optimization` | pass; 126.2s; 133,279 tok; 11 gen/1 poll | pass; 108.0s; 131,540 tok; 10 gen/1 poll | both passed |
+| `prove-plus-comm` | pass; 26.4s; 28,342 tok; 4 gen/0 poll | pass; 80.1s; 110,699 tok; 11 gen/0 poll | both passed |
+| `pypi-server` | pass; 118.0s; 102,418 tok; 11 gen/0 poll | fail; 92.2s; 119,107 tok; 11 gen/0 poll | Nanocodex only passed |
+| `regex-log` | pass; 134.0s; 120,871 tok; 12 gen/0 poll | pass; 54.5s; 50,174 tok; 5 gen/0 poll | both passed |
+| `reshard-c4-data` | pass; 239.9s; 220,157 tok; 14 gen/3 poll | pass; 256.9s; 297,015 tok; 16 gen/2 poll | both passed |
+| `sqlite-db-truncate` | pass; 74.9s; 73,887 tok; 9 gen/0 poll | pass; 99.3s; 97,546 tok; 9 gen/0 poll | both passed |
+| `sqlite-with-gcov` | pass; 129.9s; 181,749 tok; 12 gen/1 poll | pass; 119.1s; 259,261 tok; 15 gen/3 poll | both passed |
+| `winning-avg-corewars` | pass; 179.6s; 271,271 tok; 18 gen/1 poll | pass; 203.5s; 359,957 tok; 21 gen/0 poll | both passed |
+
+### Fifth-wave diagnoses
+
+- `log-summary-date-ranges`: stock Codex extracts the date with one fixed
+  offset from `FILENAME`, which is wrong for differently sized source suffixes
+  such as `_db` and `_auth`, and matches `ERROR` anywhere in a line instead of
+  the bracketed severity field. Nanocodex strips the basename and matches
+  `[(ERROR|WARNING|INFO)]`, producing all exact verifier counts. This first
+  split is stochastic rather than a stable loop advantage: all three
+  concurrently launched repeats passed on both arms. Across four samples,
+  Nanocodex is 4/4 and stock Codex is 3/4.
+- `kv-store-grpc` and `pypi-server`: both implementations create working
+  services and prove them during the agent turn. Detached children are cleaned
+  up by both shell tools. Nanocodex then uses a managed long-running execution
+  session which is still alive when the canonical verifier runs. Stock Codex
+  also proves the service during its turn, but its execution session is gone
+  after the `codex exec` process exits; the verifier sees connection refused.
+  These are lifecycle/session-retention score splits, not implementation or
+  response-chain failures.
+- `mteb-retrieve`: the task requires the pinned BGE model's fifth cosine
+  result. Nanocodex uses asymmetric `PromptType.query` and
+  `PromptType.passage` encodings under `T2Retrieval`, ranking MTEB fifth.
+  Stock Codex sets `prompt_type=None` for one joint encoding, ranking
+  HumanEval fifth and MTEB seventh.
+- `feal-linear-cryptanalysis`: Nanocodex recognizes the exact four-round
+  Feistel constraints and moves to Z3 by its third generation turn. Stock
+  Codex spends several turns on empirical linear scores and invariants before
+  switching to Z3. Both pass, but stock uses nine more generation turns,
+  194,922 more tokens, and 124.6 more seconds.
+- `circuit-fibsqrt`: both agents explicitly request a 30-second yield for
+  randomized validation. Nanocodex's generated circuit runs slowly enough to
+  need three more 30-second poll turns; stock Codex completes within the
+  initial wait. This is generated-program speed, not a hidden default tool
+  timeout mismatch.
+- `fix-ocaml-gc` is the largest completed loop-cost split in this wave.
+  Nanocodex passes in 22 generation turns and six detected polls. Stock passes
+  in 44 generation turns and 13 polls, using 1,594,971 more tokens and 84.1
+  more seconds.
+
+At this snapshot all three `log-summary-date-ranges` repeats were complete and
+the scheduler was running `polyglot-c-py`, `hf-model-inference`,
+`custom-memory-heap-crash`, `pytorch-model-cli`, `write-compressor`, and
+`headless-terminal` in their released memory. `train-fasttext` was still
+active from the original backfill. All artifacts are retained below:
+
+`/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-wave5-20260729T0544Z`
+
 ## Runner validation
 
 - 2026-07-28: the pre-VM-invariant native differential runner passed both arms
