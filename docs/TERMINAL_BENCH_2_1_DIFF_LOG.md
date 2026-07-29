@@ -620,7 +620,157 @@ active from the original backfill. All artifacts are retained below:
   faster and uses 67,536 fewer tokens despite the two polls. This is a useful
   counterexample to treating every detected poll as a material regression.
 
-## Results
+## Complete matched Code Mode-only baseline
+
+Snapshot: 2026-07-29 07:14 UTC.
+
+- The pinned `gpt-5.6-sol` / medium / web-search-off / stock
+  `code_mode_only` baseline is complete for all 89 Terminal-Bench 2.1 tasks.
+  Every arm ran in its own disposable microVM through the Nanocodex evaluator;
+  Harbor did not run any task.
+- Raw first-sample classifications are 65 both passed, 14 Nanocodex only,
+  two stock Codex only, six neither passed, and two incomplete. The two
+  incomplete records are `break-filter-js-from-html` and
+  `vulnerable-secret`: both agents safety-refused, but the old stock adapter
+  discarded its terminal refusal as an infrastructure failure.
+- Commit `1e1da0bb` recognizes the stock refusal, preserves its failed
+  `AgentResult` and ATIF trajectory, and lets retained legacy captures be
+  reanalyzed without inventing missing trajectory data. Fresh reruns of both
+  tasks prove the corrected classification is neither passed, with
+  `agent_safety_refusal` on both arms and no trajectory error. The causally
+  corrected baseline is therefore 65 both passed, 14 Nanocodex only, two
+  stock Codex only, eight neither passed, and zero incomplete.
+- On the verifier-score axis, Nanocodex passes 79/89 tasks (88.8%) and stock
+  Codex passes 67/89 (75.3%). These are first-sample results, not confidence
+  intervals. `model-extraction-relu-logits` produced a passing Nanocodex
+  artifact before a later safety refusal, while
+  `feal-differential-cryptanalysis` is a Nanocodex pass against a stock safety
+  refusal; neither is a clean loop-quality win.
+- Across the 87 first samples with comparable retained API usage, Nanocodex
+  uses 43,855,957 tokens versus stock Codex's 50,360,048: 6,504,091 fewer,
+  or 12.9% below stock. It takes 21,800,121 ms of aggregate agent time versus
+  21,531,427 ms, 268.7 seconds (1.25%) slower. Nanocodex uses 1,506 generation
+  turns and 240 detected poll turns versus stock's 1,687 generation turns and
+  243 polls. Among the 65 both-passed tasks, Nanocodex is faster on 28 and
+  uses fewer tokens on 41.
+- These results still do not have byte-identical first-turn context. Retained
+  stock requests exposed MCP resource and plugin-install tools that are
+  irrelevant to this experiment. Commit `b2ac2645` disables Apps, Plugins,
+  Tool Suggest, multi-agent execution, and `request_user_input` in the common
+  stock profile, and API-comparison schema v10 separately records nested Code
+  Mode tool names, order, section bytes, and SHA-256 definitions. A fresh
+  context-parity smoke and schema-v10 reanalysis follow its host build.
+- Repeats show why score splits must not immediately become implementation
+  changes. The original `dna-insert` and `extract-elf` samples were stock-only
+  passes. Two repeats of each produced, respectively, Nanocodex-only then
+  stock-only for `dna-insert`, and both-passed then neither-passed for
+  `extract-elf`. Through three samples each, Nanocodex is 1/3 and stock is
+  2/3 on both tasks; the winner changes without a loop change.
+- The current repeat cohort is
+  `/mnt/nanocodex-evals/part2-0a101e3/pr61-eval-diff/output/medium-code-mode-only-failure-repeats-v6-20260729T0714Z`.
+  It runs `dna-assembly`, `filter-js-from-html`,
+  `pytorch-model-recovery`, `raman-fitting`, `video-processing`, and a third
+  `dna-insert` repeat alongside the still-running `qemu-startup` repeat. Their
+  two-arm declared guest-memory sum is exactly 48 GiB; freed capacity is
+  backfilled rather than reserved per sweep.
+
+| # | Task | Nanocodex | stock Codex | First-sample classification |
+| ---: | --- | --- | --- | --- |
+| 1 | `adaptive-rejection-sampler` | pass; 314.1s; 316,327 tok; 11 gen/2 poll | pass; 363.2s; 447,126 tok; 14 gen/3 poll | both passed |
+| 2 | `bn-fit-modify` | pass; 97.4s; 72,128 tok; 7 gen/0 poll | pass; 94.6s; 105,491 tok; 9 gen/0 poll | both passed |
+| 3 | `break-filter-js-from-html` | safety refusal; 40.8s | safety refusal; legacy timing unavailable | neither passed; adapter corrected |
+| 4 | `build-cython-ext` | pass; 309.7s; 638,581 tok; 24 gen/0 poll | pass; 294.8s; 564,925 tok; 27 gen/0 poll | both passed |
+| 5 | `build-pmars` | pass; 168.8s; 388,452 tok; 17 gen/0 poll | pass; 152.2s; 276,064 tok; 14 gen/1 poll | both passed |
+| 6 | `build-pov-ray` | pass; 241.5s; 1,068,366 tok; 28 gen/0 poll | pass; 91.4s; 305,277 tok; 13 gen/0 poll | both passed |
+| 7 | `caffe-cifar-10` | pass; 436.3s; 943,920 tok; 20 gen/4 poll | pass; 468.7s; 1,720,340 tok; 45 gen/11 poll | both passed |
+| 8 | `cancel-async-tasks` | pass; 63.5s; 38,599 tok; 5 gen/0 poll | pass; 87.6s; 40,362 tok; 4 gen/0 poll | both passed |
+| 9 | `chess-best-move` | pass; 51.5s; 80,502 tok; 8 gen/0 poll | pass; 193.7s; 212,364 tok; 18 gen/2 poll | both passed |
+| 10 | `circuit-fibsqrt` | pass; 252.5s; 129,940 tok; 10 gen/3 poll | pass; 203.2s; 184,569 tok; 12 gen/0 poll | both passed |
+| 11 | `cobol-modernization` | pass; 233.3s; 232,733 tok; 16 gen/0 poll | pass; 257.5s; 327,914 tok; 18 gen/0 poll | both passed |
+| 12 | `code-from-image` | pass; 22.5s; 38,957 tok; 5 gen/0 poll | pass; 31.1s; 49,052 tok; 5 gen/0 poll | both passed |
+| 13 | `compile-compcert` | pass; 1,256.9s; 6,743,839 tok; 122 gen/90 poll | pass; 1,235.8s; 6,432,775 tok; 124 gen/99 poll | both passed |
+| 14 | `configure-git-webserver` | pass; 127.2s; 132,874 tok; 11 gen/1 poll | fail; 110.2s; 94,434 tok; 8 gen/0 poll | Nanocodex only |
+| 15 | `constraints-scheduling` | pass; 31.6s; 34,274 tok; 4 gen/0 poll | pass; 51.2s; 54,566 tok; 5 gen/0 poll | both passed |
+| 16 | `count-dataset-tokens` | pass; 126.6s; 176,605 tok; 13 gen/2 poll | pass; 152.3s; 387,134 tok; 17 gen/0 poll | both passed |
+| 17 | `crack-7z-hash` | pass; 295.2s; 263,113 tok; 25 gen/4 poll | pass; 222.1s; 299,552 tok; 22 gen/3 poll | both passed |
+| 18 | `custom-memory-heap-crash` | pass; 183.0s; 194,557 tok; 15 gen/0 poll | pass; 163.2s; 298,562 tok; 19 gen/0 poll | both passed |
+| 19 | `db-wal-recovery` | pass; 80.1s; 68,359 tok; 8 gen/0 poll | pass; 230.5s; 164,488 tok; 13 gen/0 poll | both passed |
+| 20 | `distribution-search` | pass; 86.9s; 47,414 tok; 5 gen/0 poll | pass; 53.6s; 42,136 tok; 4 gen/0 poll | both passed |
+| 21 | `dna-assembly` | fail; 350.6s; 390,880 tok; 20 gen/0 poll | fail; 281.3s; 377,197 tok; 15 gen/0 poll | neither passed |
+| 22 | `dna-insert` | fail; 127.7s; 178,575 tok; 12 gen/0 poll | pass; 138.7s; 191,783 tok; 12 gen/0 poll | stock Codex only |
+| 23 | `extract-elf` | fail; 128.7s; 131,184 tok; 9 gen/0 poll | pass; 113.1s; 122,126 tok; 8 gen/0 poll | stock Codex only |
+| 24 | `extract-moves-from-video` | pass; 1,048.8s; 3,692,342 tok; 60 gen/12 poll | pass; 1,182.6s; 4,187,986 tok; 86 gen/19 poll | both passed |
+| 25 | `feal-differential-cryptanalysis` | pass; 127.4s; 57,893 tok; 6 gen/0 poll | safety refusal; 59.2s | Nanocodex score only; stock refused |
+| 26 | `feal-linear-cryptanalysis` | pass; 112.9s; 96,166 tok; 8 gen/0 poll | pass; 237.5s; 291,088 tok; 17 gen/0 poll | both passed |
+| 27 | `filter-js-from-html` | fail; 165.5s; 117,756 tok; 9 gen/0 poll | fail; 132.4s; 128,193 tok; 9 gen/0 poll | neither passed |
+| 28 | `financial-document-processor` | pass; 120.1s; 218,010 tok; 11 gen/0 poll | pass; 141.1s; 419,452 tok; 14 gen/0 poll | both passed |
+| 29 | `fix-code-vulnerability` | pass; 66.3s; 179,241 tok; 9 gen/0 poll | pass; 63.8s; 145,537 tok; 8 gen/0 poll | both passed |
+| 30 | `fix-git` | pass; 77.3s; 110,256 tok; 11 gen/0 poll | pass; 68.6s; 109,743 tok; 10 gen/0 poll | both passed |
+| 31 | `fix-ocaml-gc` | pass; 341.2s; 673,357 tok; 22 gen/6 poll | pass; 425.3s; 2,268,328 tok; 44 gen/13 poll | both passed |
+| 32 | `gcode-to-text` | pass; 98.5s; 145,080 tok; 11 gen/0 poll | pass; 175.2s; 333,060 tok; 22 gen/0 poll | both passed |
+| 33 | `git-leak-recovery` | pass; 154.8s; 140,350 tok; 13 gen/0 poll | pass; 117.7s; 74,304 tok; 7 gen/0 poll | both passed |
+| 34 | `git-multibranch` | pass; 211.6s; 220,502 tok; 16 gen/0 poll | pass; 284.4s; 302,879 tok; 18 gen/0 poll | both passed |
+| 35 | `gpt2-codegolf` | pass; 448.3s; 298,786 tok; 19 gen/1 poll | pass; 444.2s; 377,462 tok; 23 gen/0 poll | both passed |
+| 36 | `headless-terminal` | pass; 130.0s; 79,433 tok; 8 gen/0 poll | pass; 220.6s; 207,589 tok; 15 gen/0 poll | both passed |
+| 37 | `hf-model-inference` | pass; 130.7s; 109,589 tok; 12 gen/2 poll | fail; 199.7s; 192,928 tok; 16 gen/2 poll | Nanocodex only |
+| 38 | `install-windows-3.11` | pass; 576.7s; 2,796,296 tok; 60 gen/3 poll | pass; 542.2s; 3,138,753 tok; 56 gen/11 poll | both passed |
+| 39 | `kv-store-grpc` | pass; 165.7s; 87,522 tok; 10 gen/1 poll | fail; 112.9s; 109,940 tok; 10 gen/1 poll | Nanocodex only |
+| 40 | `large-scale-text-editing` | pass; 78.8s; 31,536 tok; 4 gen/0 poll | pass; 74.6s; 48,728 tok; 5 gen/0 poll | both passed |
+| 41 | `largest-eigenval` | pass; 311.9s; 385,556 tok; 22 gen/0 poll | pass; 185.0s; 105,128 tok; 9 gen/0 poll | both passed |
+| 42 | `llm-inference-batching-scheduler` | pass; 299.9s; 320,711 tok; 15 gen/0 poll | pass; 192.8s; 160,088 tok; 9 gen/0 poll | both passed |
+| 43 | `log-summary-date-ranges` | pass; 31.9s; 46,423 tok; 5 gen/0 poll | fail; 77.3s; 56,641 tok; 5 gen/0 poll | Nanocodex only |
+| 44 | `mailman` | pass; 280.3s; 520,379 tok; 19 gen/0 poll | pass; 202.4s; 520,210 tok; 19 gen/1 poll | both passed |
+| 45 | `make-doom-for-mips` | pass; 729.4s; 5,580,092 tok; 70 gen/12 poll | pass; 712.0s; 5,871,823 tok; 85 gen/10 poll | both passed |
+| 46 | `make-mips-interpreter` | pass; 453.3s; 1,069,015 tok; 25 gen/3 poll | fail; 402.0s; 1,183,353 tok; 33 gen/1 poll | Nanocodex only |
+| 47 | `mcmc-sampling-stan` | pass; 676.3s; 2,201,066 tok; 45 gen/27 poll | pass; 672.1s; 2,162,081 tok; 48 gen/13 poll | both passed |
+| 48 | `merge-diff-arc-agi-task` | pass; 150.0s; 246,320 tok; 14 gen/0 poll | pass; 135.6s; 328,443 tok; 17 gen/0 poll | both passed |
+| 49 | `model-extraction-relu-logits` | passing artifact then safety refusal; 102.4s; 16,677 tok; 3 gen/0 poll | fail; 96.2s; 88,424 tok; 7 gen/0 poll | Nanocodex score only; lifecycle caveat |
+| 50 | `modernize-scientific-stack` | pass; 39.4s; 34,043 tok; 4 gen/0 poll | pass; 37.1s; 52,912 tok; 5 gen/0 poll | both passed |
+| 51 | `mteb-leaderboard` | pass; 375.3s; 752,043 tok; 32 gen/4 poll | pass; 309.3s; 1,619,030 tok; 36 gen/0 poll | both passed |
+| 52 | `mteb-retrieve` | pass; 98.4s; 106,550 tok; 12 gen/1 poll | fail; 93.8s; 88,138 tok; 9 gen/0 poll | Nanocodex only |
+| 53 | `multi-source-data-merger` | pass; 55.9s; 36,302 tok; 4 gen/0 poll | pass; 89.1s; 41,680 tok; 4 gen/0 poll | both passed |
+| 54 | `nginx-request-logging` | pass; 70.8s; 79,794 tok; 8 gen/0 poll | pass; 66.0s; 84,748 tok; 7 gen/0 poll | both passed |
+| 55 | `openssl-selfsigned-cert` | pass; 65.4s; 51,778 tok; 6 gen/0 poll | pass; 76.6s; 78,890 tok; 7 gen/0 poll | both passed |
+| 56 | `overfull-hbox` | pass; 100.6s; 107,631 tok; 9 gen/0 poll | fail; 150.9s; 215,648 tok; 14 gen/0 poll | Nanocodex only |
+| 57 | `password-recovery` | pass; 489.6s; 459,335 tok; 26 gen/2 poll | pass; 290.1s; 465,087 tok; 22 gen/0 poll | both passed |
+| 58 | `path-tracing` | pass; 525.5s; 719,801 tok; 35 gen/0 poll | pass; 715.9s; 698,100 tok; 36 gen/0 poll | both passed |
+| 59 | `path-tracing-reverse` | pass; 278.8s; 2,117,494 tok; 27 gen/0 poll | pass; 668.1s; 1,761,732 tok; 31 gen/0 poll | both passed |
+| 60 | `polyglot-c-py` | pass; 197.0s; 97,532 tok; 9 gen/0 poll | pass; 125.7s; 97,486 tok; 9 gen/0 poll | both passed |
+| 61 | `polyglot-rust-c` | pass; 147.8s; 51,612 tok; 5 gen/0 poll | pass; 151.0s; 127,481 tok; 10 gen/0 poll | both passed |
+| 62 | `portfolio-optimization` | pass; 126.2s; 133,279 tok; 11 gen/1 poll | pass; 108.0s; 131,540 tok; 10 gen/1 poll | both passed |
+| 63 | `protein-assembly` | pass; 280.0s; 204,076 tok; 12 gen/0 poll | fail; 555.1s; 917,913 tok; 25 gen/0 poll | Nanocodex only |
+| 64 | `prove-plus-comm` | pass; 26.4s; 28,342 tok; 4 gen/0 poll | pass; 80.1s; 110,699 tok; 11 gen/0 poll | both passed |
+| 65 | `pypi-server` | pass; 118.0s; 102,418 tok; 11 gen/0 poll | fail; 92.2s; 119,107 tok; 11 gen/0 poll | Nanocodex only |
+| 66 | `pytorch-model-cli` | pass; 260.3s; 266,033 tok; 17 gen/0 poll | pass; 165.0s; 258,261 tok; 15 gen/1 poll | both passed |
+| 67 | `pytorch-model-recovery` | fail; 85.8s; 75,569 tok; 7 gen/0 poll | fail; 123.0s; 119,080 tok; 8 gen/0 poll | neither passed |
+| 68 | `qemu-alpine-ssh` | pass; 349.0s; 255,951 tok; 26 gen/3 poll | fail; 570.9s; 1,152,892 tok; 56 gen/8 poll | Nanocodex only |
+| 69 | `qemu-startup` | pass; 332.7s; 356,467 tok; 27 gen/0 poll | pass; 103.1s; 101,556 tok; 10 gen/0 poll | both passed |
+| 70 | `query-optimize` | pass; 262.6s; 123,502 tok; 12 gen/3 poll | pass; 334.5s; 299,001 tok; 20 gen/1 poll | both passed |
+| 71 | `raman-fitting` | fail; 169.3s; 236,079 tok; 19 gen/0 poll | fail; 241.8s; 360,695 tok; 21 gen/0 poll | neither passed |
+| 72 | `regex-chess` | pass; 388.6s; 415,895 tok; 19 gen/2 poll | pass; 410.5s; 483,431 tok; 18 gen/0 poll | both passed |
+| 73 | `regex-log` | pass; 134.0s; 120,871 tok; 12 gen/0 poll | pass; 54.5s; 50,174 tok; 5 gen/0 poll | both passed |
+| 74 | `reshard-c4-data` | pass; 239.9s; 220,157 tok; 14 gen/3 poll | pass; 256.9s; 297,015 tok; 16 gen/2 poll | both passed |
+| 75 | `rstan-to-pystan` | pass; 536.2s; 663,649 tok; 20 gen/6 poll | pass; 358.9s; 928,838 tok; 25 gen/5 poll | both passed |
+| 76 | `sam-cell-seg` | pass; 175.9s; 97,750 tok; 8 gen/0 poll | pass; 183.8s; 89,175 tok; 6 gen/0 poll | both passed |
+| 77 | `sanitize-git-repo` | pass; 379.5s; 430,092 tok; 24 gen/0 poll | fail; 300.7s; 502,079 tok; 25 gen/0 poll | Nanocodex only |
+| 78 | `schemelike-metacircular-eval` | pass; 335.8s; 347,365 tok; 13 gen/0 poll | pass; 194.7s; 247,993 tok; 10 gen/1 poll | both passed |
+| 79 | `sparql-university` | pass; 61.0s; 76,971 tok; 7 gen/0 poll | fail; 54.1s; 102,026 tok; 8 gen/0 poll | Nanocodex only |
+| 80 | `sqlite-db-truncate` | pass; 74.9s; 73,887 tok; 9 gen/0 poll | pass; 99.3s; 97,546 tok; 9 gen/0 poll | both passed |
+| 81 | `sqlite-with-gcov` | pass; 129.9s; 181,749 tok; 12 gen/1 poll | pass; 119.1s; 259,261 tok; 15 gen/3 poll | both passed |
+| 82 | `torch-pipeline-parallelism` | fail; 166.2s; 100,241 tok; 8 gen/0 poll | fail; 159.3s; 88,422 tok; 7 gen/0 poll | neither passed |
+| 83 | `torch-tensor-parallelism` | pass; 110.0s; 70,291 tok; 7 gen/0 poll | pass; 96.5s; 85,506 tok; 7 gen/0 poll | both passed |
+| 84 | `train-fasttext` | pass; 1,591.2s; 2,002,786 tok; 64 gen/38 poll | pass; 1,179.5s; 1,855,067 tok; 82 gen/31 poll | both passed |
+| 85 | `tune-mjcf` | pass; 314.7s; 169,734 tok; 13 gen/2 poll | pass; 178.3s; 146,827 tok; 12 gen/0 poll | both passed |
+| 86 | `video-processing` | fail; 248.0s; 305,991 tok; 16 gen/0 poll | fail; 245.2s; 270,497 tok; 14 gen/0 poll | neither passed |
+| 87 | `vulnerable-secret` | safety refusal; 7.1s | safety refusal; legacy timing unavailable | neither passed; adapter corrected |
+| 88 | `winning-avg-corewars` | pass; 179.6s; 271,271 tok; 18 gen/1 poll | pass; 203.5s; 359,957 tok; 21 gen/0 poll | both passed |
+| 89 | `write-compressor` | pass; 204.5s; 161,093 tok; 13 gen/0 poll | pass; 141.8s; 84,160 tok; 7 gen/0 poll | both passed |
+
+## Earlier rolling task notes
+
+The table below is retained as the chronological diagnosis record from while
+the campaign was still running. Its `pending` and `running` cells are
+historical; the complete table above is authoritative.
 
 | # | Task | Model / effort | Nanocodex | Codex | Classification | Evidence | Diagnosis | Next action |
 | ---: | --- | --- | --- | --- | --- | --- | --- | --- |

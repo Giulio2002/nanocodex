@@ -3,10 +3,11 @@
 ## Objective
 
 Build a lean, library-first reimplementation of the supported Codex agent loop:
-Codex-level benchmark performance with Pi-like customizability. Nanocodex owns
-the complete agent lifecycle and typed OpenAI boundary without inheriting an
-app server, generic provider layer, approval framework, or other product
-surface that an embedding application does not need.
+meet or beat pinned stock-Codex benchmark performance and robustness with
+Pi-like customizability. Nanocodex owns the complete agent lifecycle and typed
+OpenAI boundary without inheriting an app server, generic provider layer,
+approval framework, or other product surface that an embedding application
+does not need.
 
 The development method is differential and eval-driven. We run Nanocodex and a
 pinned stock-Codex binary on the same tasks with the same model, effort, tool
@@ -202,7 +203,10 @@ agent experiments cheap:
 
 The goal is a fast cycle: launch a bounded sweep, observe live drift, inspect
 the exact paired evidence, make one justified loop change, and rerun only the
-coordinates needed to test it.
+coordinates needed to test it. Retaining and displaying a difference is not
+the endpoint: repeated Codex advantages must become a Nanocodex loop,
+context/cache, or tool improvement (with a focused regression test), while
+repeated Nanocodex advantages are preserved.
 
 #### Part 3 completion gates
 
@@ -215,6 +219,8 @@ Part 3 is complete when:
   retained on disk;
 - a controlled `code_mode_only` matrix can run across tasks and reasoning
   efforts with exact paired artifacts;
+- repeated stock-Codex advantages have an evidence-backed diagnosis and either
+  a verified Nanocodex improvement or an explicit external/policy boundary;
 - the differ reports request, response, context/cache, tool, trajectory, and
   verifier divergence while attempts run;
 - interrupted and resumed sweeps preserve exact cardinality and partial
@@ -223,7 +229,7 @@ Part 3 is complete when:
 - a representative Turbo run demonstrates bounded, host-saturating execution
   on `dev-georgios`.
 
-Current status (2026-07-28): PR #58 is merged. Draft PR #61 now integrates the
+Current status (2026-07-29): PR #58 is merged. Draft PR #61 now integrates the
 owned evaluator, Harbor-compatible presentation, complete `nanocodex eval`
 command tree, stock-Codex capture proxy, paired runner, semantic differ, task
 inventory, and running log on current `master`. The paired lifecycle and VM
@@ -238,8 +244,13 @@ Nanocodex evaluation and concurrent matched-profile Codex differential
 evaluation through automatically built, commit-bound guest runtimes. The
 schema-v5 differ exposed both the first request drift and a one-turn outer-loop
 variance live while preserving exact API, ATIF, event, and verifier evidence.
-The current per-attempt VM adapter is not yet the task-worker allocation
-described above, so no one-VM-per-task or host-saturation claim is complete.
+The first-sample medium-effort `code_mode_only` baseline is complete for all 89
+Terminal-Bench 2.1 tasks: Nanocodex scores 79/89 and stock Codex 67/89, before
+repetition-based confidence. API-comparison schema v10 now fingerprints every
+nested Code Mode definition. The current per-attempt VM adapter has sustained
+a 48 GiB work-conserving guest budget, but it is not yet the task-worker
+allocation described above, so no one-VM-per-task or final host-saturation
+claim is complete.
 
 ## Current execution order
 
@@ -251,13 +262,16 @@ described above, so no one-VM-per-task or host-saturation claim is complete.
    output.
 4. [x] Strengthen the live differ wherever that evidence exposes an ambiguous
    or late diagnosis.
-5. [ ] Implement and gate task-worker tenant isolation and the memory-weighted
+5. [x] Run the first-sample Terminal-Bench 2.1 `code_mode_only` differential
+   baseline on `dev-georgios` and maintain the complete on-disk task log.
+6. [ ] Make first-turn context equivalent, repeat score/cost outliers, and turn
+   stable stock-Codex advantages into focused Nanocodex improvements.
+7. [ ] Implement and gate task-worker tenant isolation and the memory-weighted
    work-conserving scheduler.
-6. [ ] Run the bounded Terminal-Bench 2.1 differential matrix on
-   `dev-georgios`, maintaining the on-disk task log.
-7. [ ] Run stock Codex normal Code Mode versus `code_mode_only`; adopt mixed
+8. [ ] Run stock Codex normal Code Mode versus `code_mode_only`; adopt mixed
    tool exposure only if the controlled result is better.
-8. [ ] Layer RLM and trajectory-labeling experiments on the proven evaluator.
+9. [ ] Rerun the winning configuration across supported efforts, then layer
+   RLM and trajectory-labeling experiments on the proven evaluator.
 
 ## Current non-goals
 
