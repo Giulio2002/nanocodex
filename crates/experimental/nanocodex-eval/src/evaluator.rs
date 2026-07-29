@@ -2461,6 +2461,7 @@ fn eval_exception(error: &EvalError, occurred_at: DateTime<Utc>) -> EvalExceptio
 fn failure_outcome(error: &EvalError) -> EvalOutcome {
     match error {
         EvalError::Nanocodex(error) if is_safety_refusal(error) => EvalOutcome::SafetyRefusal,
+        EvalError::Codex(error) if error.is_safety_refusal() => EvalOutcome::SafetyRefusal,
         EvalError::AgentTimeout(_) => EvalOutcome::AgentTimeout,
         _ => EvalOutcome::InfrastructureError,
     }
@@ -2469,6 +2470,9 @@ fn failure_outcome(error: &EvalError) -> EvalOutcome {
 fn failure_kind(error: &EvalError) -> EvalExceptionKind {
     match error {
         EvalError::Nanocodex(error) if is_safety_refusal(error) => {
+            EvalExceptionKind::AgentSafetyRefusal
+        }
+        EvalError::Codex(error) if error.is_safety_refusal() => {
             EvalExceptionKind::AgentSafetyRefusal
         }
         EvalError::Nanocodex(error)
@@ -5019,10 +5023,12 @@ mod tracing_tests {
     use uuid::Uuid;
 
     use super::{
-        AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind,
+        AdmissionController, EvalError, Evaluator, SweepCoordinate, failure_kind, failure_outcome,
         output_aliases_task_package, trial_name, validate_attempt_environment,
     };
-    use crate::{EvalExceptionKind, Sweep, Task, native::NativeAttempt, sweep::AgentId};
+    use crate::{
+        EvalExceptionKind, EvalOutcome, Sweep, Task, native::NativeAttempt, sweep::AgentId,
+    };
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<HashMap<u64, CapturedSpan>>>);
@@ -5354,6 +5360,16 @@ allow_internet = false
             .into(),
         ));
 
+        assert_eq!(failure_kind(&error), EvalExceptionKind::AgentSafetyRefusal);
+    }
+
+    #[test]
+    fn classifies_stock_codex_policy_rejection_as_an_agent_safety_refusal() {
+        let error = EvalError::Codex(crate::CodexExecError::SafetyRefusal(
+            "flagged for possible cybersecurity risk".to_owned(),
+        ));
+
+        assert_eq!(failure_outcome(&error), EvalOutcome::SafetyRefusal);
         assert_eq!(failure_kind(&error), EvalExceptionKind::AgentSafetyRefusal);
     }
 

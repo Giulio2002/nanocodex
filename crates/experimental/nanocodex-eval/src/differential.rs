@@ -2875,17 +2875,21 @@ fn empty_write_stdin_arguments(tool_call: &AtifToolCall) -> Option<serde_json::V
 }
 
 impl TrajectoryComparison {
+    const fn unavailable() -> Self {
+        Self {
+            comparable: false,
+            tool_sequence_comparable: false,
+            tool_sequence_equal: None,
+            codex_minus_nanocodex: None,
+        }
+    }
+
     fn from_arms(nanocodex: &ArmReport, codex: &ArmReport) -> Self {
         let (Some(nanocodex), Some(codex)) = (
             nanocodex.trajectory_summary.as_ref(),
             codex.trajectory_summary.as_ref(),
         ) else {
-            return Self {
-                comparable: false,
-                tool_sequence_comparable: false,
-                tool_sequence_equal: None,
-                codex_minus_nanocodex: None,
-            };
+            return Self::unavailable();
         };
         Self::from_summaries(nanocodex, codex)
     }
@@ -3562,40 +3566,17 @@ fn reanalyze_inner(path: &Path) -> InternalResult<DifferentialReanalysis> {
                 comparison_path.display()
             )
         })?;
-    let nanocodex_trajectory_path = required_retained_artifact_path(
-        &comparison,
-        directory,
-        "/nanocodex/trajectory",
-        "Nanocodex",
-        "trajectory",
-    )?;
-    let codex_trajectory_path = required_retained_artifact_path(
-        &comparison,
-        directory,
-        "/codex/trajectory",
-        "Codex",
-        "trajectory",
-    )?;
-    let nanocodex_trajectory: AtifTrajectory =
-        serde_json::from_reader(File::open(&nanocodex_trajectory_path).wrap_err_with(|| {
-            format!(
-                "failed to open retained Nanocodex trajectory {}",
-                nanocodex_trajectory_path.display()
-            )
-        })?)?;
-    let codex_trajectory: AtifTrajectory =
-        serde_json::from_reader(File::open(&codex_trajectory_path).wrap_err_with(|| {
-            format!(
-                "failed to open retained Codex trajectory {}",
-                codex_trajectory_path.display()
-            )
-        })?)?;
-    let nanocodex_trajectory_summary = TrajectorySummary::new(&nanocodex_trajectory);
-    let codex_trajectory_summary = TrajectorySummary::new(&codex_trajectory);
-    let trajectory_comparison = TrajectoryComparison::from_summaries(
-        &nanocodex_trajectory_summary,
-        &codex_trajectory_summary,
-    );
+    let nanocodex_trajectory_summary =
+        retained_trajectory_summary(&comparison, directory, "/nanocodex/trajectory", "Nanocodex")?;
+    let codex_trajectory_summary =
+        retained_trajectory_summary(&comparison, directory, "/codex/trajectory", "Codex")?;
+    let trajectory_comparison = match (
+        nanocodex_trajectory_summary.as_ref(),
+        codex_trajectory_summary.as_ref(),
+    ) {
+        (Some(nanocodex), Some(codex)) => TrajectoryComparison::from_summaries(nanocodex, codex),
+        _ => TrajectoryComparison::unavailable(),
+    };
 
     let nanocodex_api_path = retained_artifact_path(
         &comparison,
@@ -3719,23 +3700,23 @@ fn reanalyze_inner(path: &Path) -> InternalResult<DifferentialReanalysis> {
     let mut human_summary = String::new();
     let _ = writeln!(
         human_summary,
-        "reanalyzed retained trajectories{} without running either agent",
+        "reanalyzed retained evidence{} without running either agent",
         if api_summary.is_some() {
             " and API captures"
         } else {
             "; API captures unavailable"
         }
     );
-    append_shell_polling_summary(
-        &mut human_summary,
-        "nanocodex",
-        &nanocodex_trajectory_summary.shell_polling,
-    );
-    append_shell_polling_summary(
-        &mut human_summary,
-        "codex",
-        &codex_trajectory_summary.shell_polling,
-    );
+    if let Some(summary) = &nanocodex_trajectory_summary {
+        append_shell_polling_summary(&mut human_summary, "nanocodex", &summary.shell_polling);
+    } else {
+        let _ = writeln!(human_summary, "nanocodex trajectory: unavailable");
+    }
+    if let Some(summary) = &codex_trajectory_summary {
+        append_shell_polling_summary(&mut human_summary, "codex", &summary.shell_polling);
+    } else {
+        let _ = writeln!(human_summary, "codex trajectory: unavailable");
+    }
     if let Some(summary) = &api_summary {
         let _ = writeln!(
             human_summary,
@@ -3821,15 +3802,24 @@ fn retained_artifact_path(
     Ok(Some(resolved))
 }
 
-fn required_retained_artifact_path(
+fn retained_trajectory_summary(
     comparison: &serde_json::Value,
     directory: &Path,
     pointer: &str,
     arm: &str,
-    artifact: &str,
-) -> InternalResult<PathBuf> {
-    retained_artifact_path(comparison, directory, pointer, arm, artifact)?
-        .ok_or_else(|| diff_error!("{arm} comparison arm has no retained {artifact} path"))
+) -> InternalResult<Option<TrajectorySummary>> {
+    let Some(path) = retained_artifact_path(comparison, directory, pointer, arm, "trajectory")?
+    else {
+        return Ok(None);
+    };
+    let trajectory: AtifTrajectory =
+        serde_json::from_reader(File::open(&path).wrap_err_with(|| {
+            format!(
+                "failed to open retained {arm} trajectory {}",
+                path.display()
+            )
+        })?)?;
+    Ok(Some(TrajectorySummary::new(&trajectory)))
 }
 
 fn append_shell_polling_summary(output: &mut String, name: &str, summary: &ShellPollingSummary) {
@@ -5239,9 +5229,55 @@ mod tests {
         compare_api_exchanges, detected_code_mode_empty_stdin_calls, detected_polling_turn,
         diff_json, event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
         inspect_api_exchanges, newly_completed_lines, read_api_request_payloads,
-        read_optional_codex_cloud_config_cache, run_arm, stage_diff_codex_ca_bundle,
+        read_optional_codex_cloud_config_cache, reanalyze, run_arm, stage_diff_codex_ca_bundle,
         validate_matched_code_mode_only_profile,
     };
+
+    #[test]
+    fn reanalysis_keeps_missing_refusal_trajectories_unavailable() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("comparison.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "model": "gpt-5.6-sol",
+                "thinking": "medium",
+                "nanocodex": {
+                    "trajectory": null
+                },
+                "codex": {
+                    "trajectory": null
+                },
+                "artifacts": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let rebuilt = reanalyze(directory.path()).unwrap();
+
+        assert_eq!(
+            rebuilt
+                .comparison()
+                .pointer("/trajectory_comparison/comparable"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            rebuilt
+                .comparison()
+                .pointer("/nanocodex/trajectory_summary"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            rebuilt.comparison().pointer("/codex/trajectory_summary"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(
+            rebuilt
+                .human_summary()
+                .contains("codex trajectory: unavailable")
+        );
+    }
 
     #[test]
     fn codex_auth_stages_only_the_adjacent_cloud_config_cache() {

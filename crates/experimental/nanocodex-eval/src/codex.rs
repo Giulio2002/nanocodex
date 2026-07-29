@@ -507,6 +507,10 @@ pub enum CodexExecError {
     #[error("Codex turn failed: {0}")]
     TurnFailed(String),
 
+    /// Codex rejected the turn under its safety policy.
+    #[error("Codex safety refusal: {0}")]
+    SafetyRefusal(String),
+
     /// Codex exited without a terminal turn event.
     #[error("Codex exited without a turn.completed event")]
     MissingTerminal,
@@ -534,6 +538,12 @@ pub enum CodexExecError {
     },
 }
 
+impl CodexExecError {
+    pub(crate) const fn is_safety_refusal(&self) -> bool {
+        matches!(self, Self::SafetyRefusal(_))
+    }
+}
+
 pub(crate) struct CodexExecution {
     pub(crate) result: Option<AgentResult>,
     pub(crate) error: Option<CodexRunError>,
@@ -555,13 +565,13 @@ impl CodexExecution {
         duration: Duration,
         cleanup: CleanupPhase,
     ) -> Self {
-        let error = if !output.status.success() {
+        let error = if let Some(error) = output.transcript.failure() {
+            Some(CodexRunError::Execution(error))
+        } else if !output.status.success() {
             Some(CodexRunError::Execution(CodexExecError::Exit {
                 status: output.status,
                 stderr: output.stderr_tail,
             }))
-        } else if let Some(error) = output.transcript.terminal_error.clone() {
-            Some(CodexRunError::Execution(CodexExecError::TurnFailed(error)))
         } else if !output.transcript.completed {
             Some(CodexRunError::Execution(CodexExecError::MissingTerminal))
         } else {
@@ -595,13 +605,13 @@ impl CodexExecution {
         duration: Duration,
         cleanup: CleanupPhase,
     ) -> Self {
-        let error = if exit_code != 0 {
+        let error = if let Some(error) = transcript.failure() {
+            Some(CodexRunError::Execution(error))
+        } else if exit_code != 0 {
             Some(CodexRunError::Execution(CodexExecError::ExitCode {
                 code: exit_code,
                 stderr: stderr_tail,
             }))
-        } else if let Some(error) = transcript.terminal_error.clone() {
-            Some(CodexRunError::Execution(CodexExecError::TurnFailed(error)))
         } else if !transcript.completed {
             Some(CodexRunError::Execution(CodexExecError::MissingTerminal))
         } else {
@@ -974,6 +984,15 @@ impl CodexTranscript {
         });
     }
 
+    fn failure(&self) -> Option<CodexExecError> {
+        let error = self.terminal_error.clone()?;
+        if is_safety_refusal_message(&error) {
+            Some(CodexExecError::SafetyRefusal(error))
+        } else {
+            Some(CodexExecError::TurnFailed(error))
+        }
+    }
+
     fn agent_result(
         &self,
         config: &CodexExec,
@@ -982,7 +1001,11 @@ impl CodexTranscript {
         billing_completeness: BillingCompleteness,
     ) -> Option<AgentResult> {
         let usage = self.usage.as_ref().and_then(CodexUsage::totals);
-        if self.final_message.is_empty() && usage.is_none() && self.items.is_empty() {
+        if self.final_message.is_empty()
+            && usage.is_none()
+            && self.items.is_empty()
+            && self.terminal_error.is_none()
+        {
             return None;
         }
         let usage = usage.unwrap_or_default();
@@ -1035,6 +1058,10 @@ impl CodexTranscript {
             metadata,
         })
     }
+}
+
+fn is_safety_refusal_message(message: &str) -> bool {
+    message.contains("flagged for possible cybersecurity risk")
 }
 
 impl CodexUsage {
@@ -1610,6 +1637,60 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 3);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.total_tokens, 20);
+    }
+
+    #[test]
+    fn terminal_safety_refusal_retains_a_failed_result_and_empty_atif() {
+        let temporary = tempdir().unwrap();
+        let events = temporary.path().join("codex-events.jsonl");
+        let message = "This request has been flagged for possible cybersecurity risk.";
+        let input = format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"thread-refusal\"}}\n\
+             {{\"type\":\"error\",\"message\":{}}}\n\
+             {{\"type\":\"turn.failed\",\"error\":{{\"message\":{}}}}}\n",
+            serde_json::to_string(message).unwrap(),
+            serde_json::to_string(message).unwrap(),
+        );
+        fs::write(&events, &input).unwrap();
+        let mut transcript = CodexTranscript::new();
+        for (index, line) in input.lines().enumerate() {
+            transcript
+                .observe(
+                    u64::try_from(index + 1).unwrap(),
+                    &serde_json::from_str(line).unwrap(),
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            transcript.failure(),
+            Some(CodexExecError::SafetyRefusal(error)) if error == message
+        ));
+        let config =
+            CodexExec::new(std::env::current_exe().unwrap(), "gpt-5.6-sol", "medium").unwrap();
+        let result = transcript
+            .agent_result(
+                &config,
+                Duration::from_millis(10),
+                AgentStatus::Failed,
+                BillingCompleteness::Unknown,
+            )
+            .unwrap();
+        let trajectory =
+            project_codex_atif(&events, "inspect the program", &result, "codex-cli-test").unwrap();
+
+        assert_eq!(trajectory.session_id, "thread-refusal");
+        assert_eq!(trajectory.steps.len(), 2);
+        assert!(matches!(trajectory.steps[0].source, AtifSource::User));
+        assert!(matches!(trajectory.steps[1].source, AtifSource::Agent));
+        assert_eq!(
+            trajectory.final_metrics.extra.runtime_completeness,
+            MeasurementCompleteness::ObservedLowerBound
+        );
+        assert_eq!(
+            trajectory.final_metrics.extra.billing_completeness,
+            Some(BillingCompleteness::Unknown)
+        );
     }
 
     #[test]
