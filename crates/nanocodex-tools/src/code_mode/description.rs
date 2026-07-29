@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use nanocodex_oai_api::{responses::JsonSchema, tools::ToolDefinition};
 use serde_json::Value;
@@ -125,7 +125,16 @@ pub(super) fn exec_description(definitions: &[ToolDefinition], has_deferred_tool
             "\n\nShared MCP Types:\n```ts\n{MCP_TYPESCRIPT_PREAMBLE}\n```"
         );
     }
+    let mut rendered_namespaces = BTreeSet::new();
     for spec in definitions {
+        if let Some((namespace, _)) = code_mode_namespace_and_name(spec.name())
+            && rendered_namespaces.insert(namespace)
+        {
+            let _ = write!(
+                description,
+                "\n\n## {namespace}\nTools in the {namespace} namespace."
+            );
+        }
         let (input_name, input_type) = match spec {
             ToolDefinition::Function { .. } => (
                 "args",
@@ -165,6 +174,30 @@ declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{outp
         );
     }
     description
+}
+
+/// Matches Codex's Code Mode prompt order: plain tools first, followed by
+/// namespaced tools ordered by namespace and member name.
+pub(crate) fn sort_definitions(definitions: &mut [ToolDefinition]) {
+    definitions.sort_by(|left, right| {
+        let (left_namespace, left_name) = code_mode_namespace_and_name(left.name())
+            .map_or((None, left.name()), |(namespace, name)| {
+                (Some(namespace), name)
+            });
+        let (right_namespace, right_name) = code_mode_namespace_and_name(right.name())
+            .map_or((None, right.name()), |(namespace, name)| {
+                (Some(namespace), name)
+            });
+        left_namespace
+            .cmp(&right_namespace)
+            .then_with(|| left_name.cmp(right_name))
+            .then_with(|| left.name().cmp(right.name()))
+    });
+}
+
+fn code_mode_namespace_and_name(name: &str) -> Option<(&str, &str)> {
+    let (namespace, name) = name.split_once("__")?;
+    (!namespace.is_empty() && !name.is_empty()).then_some((namespace, name))
 }
 
 fn mcp_structured_content_schema(output_schema: &Value) -> Option<&Value> {
@@ -386,9 +419,10 @@ fn render_literal(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nanocodex_oai_api::tools::ToolDefinition;
     use serde_json::json;
 
-    use super::render_json_schema_to_typescript;
+    use super::{exec_description, render_json_schema_to_typescript, sort_definitions};
 
     #[test]
     fn renders_described_object_as_typescript() {
@@ -405,5 +439,45 @@ mod tests {
             render_json_schema_to_typescript(&schema),
             "{\n  choice: \"one\" | \"two\";\n  // How many.\n  count?: number;\n}"
         );
+    }
+
+    #[test]
+    fn renders_nullable_schema_types() {
+        let schema = json!({
+            "type": ["array", "null"],
+            "items": {"type": "string"}
+        });
+        assert_eq!(
+            render_json_schema_to_typescript(&schema),
+            "Array<string> | null"
+        );
+    }
+
+    #[test]
+    fn sorts_plain_tools_before_namespaces_and_renders_namespace_header() {
+        let mut definitions = vec![
+            ToolDefinition::function(
+                "image_gen__imagegen",
+                "Generate an image.",
+                json!({"type": "object"}),
+            ),
+            ToolDefinition::function("write_stdin", "Write input.", json!({"type": "object"})),
+            ToolDefinition::function("apply_patch", "Apply a patch.", json!({"type": "object"})),
+        ];
+        sort_definitions(&mut definitions);
+        assert_eq!(
+            definitions
+                .iter()
+                .map(ToolDefinition::name)
+                .collect::<Vec<_>>(),
+            ["apply_patch", "write_stdin", "image_gen__imagegen"]
+        );
+
+        let description = exec_description(&definitions, false);
+        let namespace = description
+            .find("## image_gen\nTools in the image_gen namespace.")
+            .unwrap();
+        assert!(description.find("### `write_stdin`").unwrap() < namespace);
+        assert!(namespace < description.find("### `image_gen__imagegen`").unwrap());
     }
 }

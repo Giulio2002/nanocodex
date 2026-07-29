@@ -173,7 +173,7 @@ impl ToolRuntime {
             .iter()
             .cloned()
             .partition(|definition| matches!(definition, ToolDefinition::ToolSearch { .. }));
-        nested.sort_by(|left, right| left.name().cmp(right.name()));
+        code_mode::description::sort_definitions(&mut nested);
         native.extend([
             code_mode::exec_spec(&nested, !self.registry.providers.is_empty()),
             code_mode::wait_spec(),

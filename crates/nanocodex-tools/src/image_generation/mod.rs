@@ -190,12 +190,12 @@ impl Tool for ImageGenerationHandler {
                 "properties": {
                     "prompt": { "type": "string" },
                     "referenced_image_paths": {
-                        "type": "array",
+                        "type": ["array", "null"],
                         "items": { "type": "string" },
                         "maxItems": MAX_EDIT_IMAGES
                     },
                     "num_last_images_to_include": {
-                        "type": "integer",
+                        "type": ["integer", "null"],
                         "minimum": 1,
                         "maximum": MAX_EDIT_IMAGES
                     }

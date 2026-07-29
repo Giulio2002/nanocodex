@@ -97,6 +97,11 @@ fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
 #[serde(deny_unknown_fields)]
 struct ExecCommandArguments {
     cmd: String,
+    // Codex exposes these approval metadata fields even under a fixed
+    // full-access/never-ask policy. Nanocodex accepts but does not act on
+    // them; this does not add a second approval or sandbox policy owner.
+    #[serde(default)]
+    _justification: Option<String>,
     #[serde(default)]
     workdir: Option<String>,
     #[serde(default)]
@@ -109,6 +114,10 @@ struct ExecCommandArguments {
     yield_time_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+    #[serde(default)]
+    _prefix_rule: Option<Vec<String>>,
+    #[serde(default)]
+    _sandbox_permissions: Option<String>,
 }
 
 #[derive(Deserialize)]

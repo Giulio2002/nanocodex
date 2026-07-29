@@ -153,7 +153,7 @@ impl HostedToolRuntime {
                 }
             }
         });
-        definitions.sort_by(|left, right| left.name().cmp(right.name()));
+        crate::code_mode::description::sort_definitions(&mut definitions);
         let code_mode_tool_names = definitions
             .iter()
             .map(|definition| {

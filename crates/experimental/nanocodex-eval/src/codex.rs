@@ -380,6 +380,10 @@ impl CodexExec {
             "--config".to_owned(),
             "suppress_unstable_features_warning=true".to_owned(),
             "--config".to_owned(),
+            "skills.include_instructions=false".to_owned(),
+            "--config".to_owned(),
+            "skills.bundled.enabled=false".to_owned(),
+            "--config".to_owned(),
             "tools.experimental_request_user_input.enabled=false".to_owned(),
             "--config".to_owned(),
             "model_reasoning_summary=\"auto\"".to_owned(),
@@ -1854,6 +1858,8 @@ mod tests {
             "features.apps=false",
             "features.plugins=false",
             "features.tool_suggest=false",
+            "skills.include_instructions=false",
+            "skills.bundled.enabled=false",
         ] {
             assert!(
                 arguments

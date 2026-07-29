@@ -66,6 +66,10 @@ fn exec_command_definition(name: &'static str) -> ToolDefinition {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Shell command to execute." },
+                "justification": {
+                    "type": "string",
+                    "description": "User-facing approval question for `require_escalated`; omit otherwise."
+                },
                 "workdir": {
                     "type": "string",
                     "description": "Working directory for the command. Defaults to the turn cwd."
@@ -89,6 +93,16 @@ fn exec_command_definition(name: &'static str) -> ToolDefinition {
                 "max_output_tokens": {
                     "type": "number",
                     "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy."
+                },
+                "prefix_rule": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Reusable approval prefix for `cmd`, only with `sandbox_permissions: \"require_escalated\"`; for example [\"git\", \"pull\"]."
+                },
+                "sandbox_permissions": {
+                    "type": "string",
+                    "enum": ["use_default", "require_escalated"],
+                    "description": "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
                 }
             },
             "required": ["cmd"],
