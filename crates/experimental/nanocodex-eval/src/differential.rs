@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 7;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 8;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -645,8 +645,10 @@ struct ApiEventLoopArmSummary {
     detected_poll_only_output_tokens: u64,
     prompt_cache_key_stable: Option<bool>,
     previous_response_links: u64,
+    full_history_replays: u64,
     broken_previous_response_links: u64,
     tool_result_links: u64,
+    replayed_tool_result_links: u64,
     broken_tool_result_links: u64,
 }
 
@@ -665,8 +667,10 @@ impl ApiEventLoopArmSummary {
             && self.terminal_turns == other.terminal_turns
             && self.prompt_cache_key_stable == other.prompt_cache_key_stable
             && self.previous_response_links == other.previous_response_links
+            && self.full_history_replays == other.full_history_replays
             && self.broken_previous_response_links == other.broken_previous_response_links
             && self.tool_result_links == other.tool_result_links
+            && self.replayed_tool_result_links == other.replayed_tool_result_links
             && self.broken_tool_result_links == other.broken_tool_result_links
     }
 }
@@ -3851,7 +3855,7 @@ fn append_event_loop_arm_summary(
     };
     let _ = writeln!(
         output,
-        "{name} event loop: {}/{} terminal · {} generation turns · model-visible calls {} [{}] · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {}/{} broken · tool-result links {}/{} broken · cache stable {}",
+        "{name} event loop: {}/{} terminal · {} generation turns · model-visible calls {} [{}] · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {} direct/{} replay/{} broken · tool-result links {} valid/{} replayed/{} broken · cache stable {}",
         summary.terminal_turns,
         summary.turns,
         summary.generation_turns,
@@ -3869,8 +3873,10 @@ fn append_event_loop_arm_summary(
         summary.initial_visible_tools.join(", "),
         summary.detected_poll_only_turns,
         summary.previous_response_links,
+        summary.full_history_replays,
         summary.broken_previous_response_links,
         summary.tool_result_links,
+        summary.replayed_tool_result_links,
         summary.broken_tool_result_links,
         summary
             .prompt_cache_key_stable
@@ -4360,6 +4366,7 @@ struct EventLoopNormalizeContext<'a> {
     first_prompt_cache_key: Option<&'a str>,
     previous_response_id: Option<&'a str>,
     previous_call_ids: &'a BTreeSet<String>,
+    replayed_call_ids: &'a BTreeSet<String>,
 }
 
 fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
@@ -4393,8 +4400,10 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let mut previous_response_id = None;
     let mut previous_call_ids = BTreeSet::new();
     let mut previous_response_links = 0_u64;
+    let mut full_history_replays = 0_u64;
     let mut broken_previous_response_links = 0_u64;
     let mut tool_result_links = 0_u64;
+    let mut replayed_tool_result_links = 0_u64;
     let mut broken_tool_result_links = 0_u64;
     let mut generation_turns = 0_u64;
     let mut terminal_turns = 0_u64;
@@ -4432,11 +4441,16 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             .payload
             .get("previous_response_id")
             .and_then(serde_json::Value::as_str);
+        let replayed_call_ids = request_call_ids(&request.payload);
+        let full_history_replay =
+            request_previous_response_id.is_none() && request_replays_history(&request.payload);
         if offset > 0 {
             if request_previous_response_id.is_some()
                 && request_previous_response_id == previous_response_id.as_deref()
             {
                 previous_response_links = previous_response_links.saturating_add(1);
+            } else if full_history_replay {
+                full_history_replays = full_history_replays.saturating_add(1);
             } else {
                 broken_previous_response_links = broken_previous_response_links.saturating_add(1);
             }
@@ -4445,6 +4459,9 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
         for call_id in request_tool_result_call_ids(&request.payload) {
             if previous_call_ids.contains(call_id) {
                 tool_result_links = tool_result_links.saturating_add(1);
+            } else if replayed_call_ids.contains(call_id) {
+                tool_result_links = tool_result_links.saturating_add(1);
+                replayed_tool_result_links = replayed_tool_result_links.saturating_add(1);
             } else {
                 broken_tool_result_links = broken_tool_result_links.saturating_add(1);
             }
@@ -4455,6 +4472,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             first_prompt_cache_key: first_prompt_cache_key.as_deref(),
             previous_response_id: previous_response_id.as_deref(),
             previous_call_ids: &previous_call_ids,
+            replayed_call_ids: &replayed_call_ids,
         };
         let normalized_request =
             normalize_event_loop_value(&request.payload, None, &request_context);
@@ -4463,6 +4481,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             first_prompt_cache_key: first_prompt_cache_key.as_deref(),
             previous_response_id: previous_response_id.as_deref(),
             previous_call_ids: &previous_call_ids,
+            replayed_call_ids: &replayed_call_ids,
         };
         let normalized_response =
             event_loop_response_signature(&request.response_events, &response_context);
@@ -4544,8 +4563,10 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             detected_poll_only_output_tokens,
             prompt_cache_key_stable,
             previous_response_links,
+            full_history_replays,
             broken_previous_response_links,
             tool_result_links,
+            replayed_tool_result_links,
             broken_tool_result_links,
         },
     }
@@ -4726,6 +4747,40 @@ fn request_tool_result_call_ids(request: &serde_json::Value) -> Vec<&str> {
         .collect()
 }
 
+fn request_call_ids(request: &serde_json::Value) -> BTreeSet<String> {
+    request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind.ends_with("_call") && !kind.ends_with("_call_output"))
+        })
+        .filter_map(|item| item.get("call_id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn request_replays_history(request: &serde_json::Value) -> bool {
+    request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                || item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| {
+                        kind == "reasoning"
+                            || (kind.ends_with("_call") && !kind.ends_with("_call_output"))
+                    })
+        })
+}
+
 fn response_id(events: &[serde_json::Value]) -> Option<String> {
     events
         .iter()
@@ -4842,6 +4897,11 @@ fn normalize_event_loop_value(
                     if context.previous_call_ids.contains(call_id) =>
                 {
                     "matches_previous_output".to_owned()
+                }
+                (EventLoopValueStage::Request, Some(call_id))
+                    if context.replayed_call_ids.contains(call_id) =>
+                {
+                    "matches_replayed_output".to_owned()
                 }
                 (EventLoopValueStage::Request, Some(_)) => "present_unmatched".to_owned(),
                 (EventLoopValueStage::Response, Some(_)) => "present".to_owned(),
@@ -5688,7 +5748,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 7);
+        assert_eq!(report["schema_version"], 8);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5810,6 +5870,77 @@ mod tests {
         assert_eq!(
             right.turns[1]["request"]["previous_response_id"],
             "present_unmatched"
+        );
+    }
+
+    #[test]
+    fn event_loop_recognizes_full_history_replay_and_replayed_tool_results() {
+        let mut requests = event_loop_fixture("session", "cache", "response");
+        requests[0].response_events.insert(
+            1,
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "replayed-call",
+                    "input": "text(await tools.exec_command({cmd: \"true\"}));"
+                }
+            }),
+        );
+        requests.push(ApiRequestPayload {
+            request_index: 3,
+            phase: Some("generation".to_owned()),
+            payload: serde_json::json!({
+                "type": "response.create",
+                "prompt_cache_key": "cache",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "I ran a command."}]
+                    },
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    },
+                    {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "replayed-call",
+                        "input": "text(await tools.exec_command({cmd: \"true\"}));"
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "replayed-call",
+                        "output": "ok"
+                    }
+                ]
+            }),
+            sha256: String::new(),
+            response_events: vec![serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "response-third", "status": "completed"}
+            })],
+        });
+
+        let trace = build_event_loop_trace(&requests);
+
+        assert_eq!(trace.summary.previous_response_links, 1);
+        assert_eq!(trace.summary.full_history_replays, 1);
+        assert_eq!(trace.summary.broken_previous_response_links, 0);
+        assert_eq!(trace.summary.tool_result_links, 1);
+        assert_eq!(trace.summary.replayed_tool_result_links, 1);
+        assert_eq!(trace.summary.broken_tool_result_links, 0);
+        assert!(
+            serde_json::to_string(&trace.turns[2])
+                .unwrap()
+                .contains("matches_replayed_output")
+        );
+        assert!(
+            !serde_json::to_string(&trace.turns[2])
+                .unwrap()
+                .contains("present_unmatched")
         );
     }
 
