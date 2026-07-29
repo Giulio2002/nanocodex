@@ -365,6 +365,24 @@ impl CodexExec {
                 "web_search=\"{}\"",
                 if self.web_search { "live" } else { "disabled" }
             ),
+            "--config".to_owned(),
+            "features.multi_agent=false".to_owned(),
+            "--config".to_owned(),
+            "features.multi_agent_v2=false".to_owned(),
+            "--config".to_owned(),
+            "agents.enabled=false".to_owned(),
+            "--config".to_owned(),
+            "features.apps=false".to_owned(),
+            "--config".to_owned(),
+            "features.plugins=false".to_owned(),
+            "--config".to_owned(),
+            "features.tool_suggest=false".to_owned(),
+            "--config".to_owned(),
+            "suppress_unstable_features_warning=true".to_owned(),
+            "--config".to_owned(),
+            "tools.experimental_request_user_input.enabled=false".to_owned(),
+            "--config".to_owned(),
+            "model_reasoning_summary=\"auto\"".to_owned(),
         ];
         if let Some(api_base_url) = &self.api_base_url {
             arguments.extend([
@@ -378,18 +396,6 @@ impl CodexExec {
                 "features.code_mode=true".to_owned(),
                 "--config".to_owned(),
                 "features.code_mode_only=true".to_owned(),
-                "--config".to_owned(),
-                "features.multi_agent=false".to_owned(),
-                "--config".to_owned(),
-                "features.multi_agent_v2=false".to_owned(),
-                "--config".to_owned(),
-                "agents.enabled=false".to_owned(),
-                "--config".to_owned(),
-                "suppress_unstable_features_warning=true".to_owned(),
-                "--config".to_owned(),
-                "tools.experimental_request_user_input.enabled=false".to_owned(),
-                "--config".to_owned(),
-                "model_reasoning_summary=\"auto\"".to_owned(),
             ]);
         }
         arguments.extend(["--".to_owned(), prompt.to_owned()]);
@@ -1844,6 +1850,17 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "agents.enabled=false")
         );
+        for disabled_feature in [
+            "features.apps=false",
+            "features.plugins=false",
+            "features.tool_suggest=false",
+        ] {
+            assert!(
+                arguments
+                    .iter()
+                    .any(|argument| argument == disabled_feature)
+            );
+        }
         assert!(
             arguments
                 .iter()

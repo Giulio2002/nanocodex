@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 9;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 10;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -582,7 +582,8 @@ struct ApiEventLoopComparison {
     request_count_equal: Option<bool>,
     chain_invariants_equal: Option<bool>,
     model_visible_tool_sequence_equal: Option<bool>,
-    initial_code_mode_tool_catalog_equal: Option<bool>,
+    initial_code_mode_tool_names_equal: Option<bool>,
+    initial_code_mode_tool_definitions_equal: Option<bool>,
     aligned_turns: u64,
     nanocodex_unpaired_turns: u64,
     codex_unpaired_turns: u64,
@@ -637,6 +638,7 @@ struct ApiEventLoopArmSummary {
     initial_reasoning_summary: Option<String>,
     initial_visible_tools: Vec<String>,
     initial_code_mode_tools: Option<Vec<String>>,
+    initial_code_mode_tool_definitions: Option<Vec<ApiCodeModeToolDefinitionSummary>>,
     detected_poll_only_turns: u64,
     max_consecutive_detected_poll_only_turns: u64,
     detected_empty_stdin_calls: u64,
@@ -651,6 +653,14 @@ struct ApiEventLoopArmSummary {
     tool_result_links: u64,
     replayed_tool_result_links: u64,
     broken_tool_result_links: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ApiCodeModeToolDefinitionSummary {
+    name: String,
+    ordinal: u64,
+    section_bytes: u64,
+    section_sha256: String,
 }
 
 #[derive(Default)]
@@ -3904,7 +3914,14 @@ fn append_model_visible_tool_summary(output: &mut String, comparison: &ApiEventL
         format_code_mode_tools(nanocodex.initial_code_mode_tools.as_deref()),
         format_code_mode_tools(codex.initial_code_mode_tools.as_deref()),
         comparison
-            .initial_code_mode_tool_catalog_equal
+            .initial_code_mode_tool_names_equal
+            .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
+    );
+    let _ = writeln!(
+        output,
+        "nested Code Mode tool definitions match: {}",
+        comparison
+            .initial_code_mode_tool_definitions_equal
             .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
     );
 }
@@ -4166,7 +4183,7 @@ fn compare_api_exchanges(
             nanocodex.summary.model_visible_tool_sequence
                 == codex.summary.model_visible_tool_sequence
         });
-    let initial_code_mode_tool_catalog_equal = nanocodex_event_loop
+    let initial_code_mode_tool_names_equal = nanocodex_event_loop
         .as_ref()
         .zip(codex_event_loop.as_ref())
         .and_then(|(nanocodex, codex)| {
@@ -4175,6 +4192,17 @@ fn compare_api_exchanges(
                 .initial_code_mode_tools
                 .as_ref()
                 .zip(codex.summary.initial_code_mode_tools.as_ref())
+                .map(|(nanocodex, codex)| nanocodex == codex)
+        });
+    let initial_code_mode_tool_definitions_equal = nanocodex_event_loop
+        .as_ref()
+        .zip(codex_event_loop.as_ref())
+        .and_then(|(nanocodex, codex)| {
+            nanocodex
+                .summary
+                .initial_code_mode_tool_definitions
+                .as_ref()
+                .zip(codex.summary.initial_code_mode_tool_definitions.as_ref())
                 .map(|(nanocodex, codex)| nanocodex == codex)
         });
     let nanocodex_unpaired_tail = nanocodex_event_loop
@@ -4188,7 +4216,8 @@ fn compare_api_exchanges(
         request_count_equal,
         chain_invariants_equal,
         model_visible_tool_sequence_equal,
-        initial_code_mode_tool_catalog_equal,
+        initial_code_mode_tool_names_equal,
+        initial_code_mode_tool_definitions_equal,
         aligned_turns: u64::try_from(aligned_request_count).unwrap_or(u64::MAX),
         nanocodex_unpaired_turns: u64::try_from(nanocodex_unpaired_request_count)
             .unwrap_or(u64::MAX),
@@ -4256,7 +4285,8 @@ impl ApiEventLoopComparison {
             request_count_equal: None,
             chain_invariants_equal: None,
             model_visible_tool_sequence_equal: None,
-            initial_code_mode_tool_catalog_equal: None,
+            initial_code_mode_tool_names_equal: None,
+            initial_code_mode_tool_definitions_equal: None,
             aligned_turns: 0,
             nanocodex_unpaired_turns: 0,
             codex_unpaired_turns: 0,
@@ -4382,9 +4412,17 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let initial_visible_tools = requests
         .first()
         .map_or_else(Vec::new, |request| visible_tool_names(&request.payload));
-    let initial_code_mode_tools = requests
+    let initial_code_mode_tool_definitions = requests
         .first()
-        .and_then(|request| code_mode_tool_names(&request.payload));
+        .and_then(|request| code_mode_tool_definitions(&request.payload));
+    let initial_code_mode_tools = initial_code_mode_tool_definitions
+        .as_ref()
+        .map(|definitions| {
+            definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect()
+        });
     let first_prompt_cache_key = requests
         .first()
         .and_then(|request| request.payload.get("prompt_cache_key"))
@@ -4556,6 +4594,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             initial_reasoning_summary,
             initial_visible_tools,
             initial_code_mode_tools,
+            initial_code_mode_tool_definitions,
             detected_poll_only_turns,
             max_consecutive_detected_poll_only_turns,
             detected_empty_stdin_calls,
@@ -4604,20 +4643,59 @@ fn visible_tools(request: &serde_json::Value) -> impl Iterator<Item = &serde_jso
         )
 }
 
-fn code_mode_tool_names(request: &serde_json::Value) -> Option<Vec<String>> {
+fn code_mode_tool_definitions(
+    request: &serde_json::Value,
+) -> Option<Vec<ApiCodeModeToolDefinitionSummary>> {
     let description = visible_tools(request)
         .find(|tool| visible_tool_name(tool).as_deref() == Some("exec"))?
         .get("description")
         .and_then(serde_json::Value::as_str)?;
-    let names = description
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("### `")
-                .and_then(|name| name.strip_suffix('`'))
-                .map(str::to_owned)
-        })
-        .collect::<Vec<_>>();
-    (!names.is_empty()).then_some(names)
+    let mut definitions = Vec::new();
+    let mut current_name = None::<String>;
+    let mut current_section = String::new();
+
+    for line in description.lines() {
+        if let Some(name) = line
+            .strip_prefix("### `")
+            .and_then(|name| name.strip_suffix('`'))
+        {
+            if let Some(name) = current_name.take() {
+                definitions.push(code_mode_tool_definition_summary(
+                    name,
+                    &current_section,
+                    definitions.len(),
+                ));
+            }
+            current_name = Some(name.to_owned());
+            current_section.clear();
+        }
+        if current_name.is_some() {
+            current_section.push_str(line);
+            current_section.push('\n');
+        }
+    }
+    if let Some(name) = current_name {
+        definitions.push(code_mode_tool_definition_summary(
+            name,
+            &current_section,
+            definitions.len(),
+        ));
+    }
+
+    (!definitions.is_empty()).then_some(definitions)
+}
+
+fn code_mode_tool_definition_summary(
+    name: String,
+    section: &str,
+    ordinal: usize,
+) -> ApiCodeModeToolDefinitionSummary {
+    ApiCodeModeToolDefinitionSummary {
+        name,
+        ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+        section_bytes: u64::try_from(section.len()).unwrap_or(u64::MAX),
+        section_sha256: hex::encode(Sha256::digest(section.as_bytes())),
+    }
 }
 
 fn visible_tool_name(tool: &serde_json::Value) -> Option<String> {
@@ -5753,7 +5831,11 @@ mod tests {
             }
         );
         assert_eq!(
-            summary.event_loop.initial_code_mode_tool_catalog_equal,
+            summary.event_loop.initial_code_mode_tool_names_equal,
+            Some(true)
+        );
+        assert_eq!(
+            summary.event_loop.initial_code_mode_tool_definitions_equal,
             Some(true)
         );
         assert_eq!(
@@ -5796,7 +5878,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 9);
+        assert_eq!(report["schema_version"], 10);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5876,6 +5958,42 @@ mod tests {
         assert_ne!(
             left.summary.initial_code_mode_tools,
             right.summary.initial_code_mode_tools
+        );
+        let left_definitions = left
+            .summary
+            .initial_code_mode_tool_definitions
+            .as_ref()
+            .unwrap();
+        let right_definitions = right
+            .summary
+            .initial_code_mode_tool_definitions
+            .as_ref()
+            .unwrap();
+        assert_eq!(left_definitions[0].name, "exec_command");
+        assert_eq!(left_definitions[0].ordinal, 0);
+        assert_eq!(left_definitions[0], right_definitions[0]);
+        assert_ne!(left_definitions[1], right_definitions[1]);
+    }
+
+    #[test]
+    fn event_loop_summary_detects_changed_nested_tool_definitions_with_equal_names() {
+        let mut left = event_loop_fixture("left-session", "left-cache", "left-response");
+        let mut right = event_loop_fixture("right-session", "right-cache", "right-response");
+        left[0].payload["input"][0]["tools"][0]["description"] =
+            serde_json::json!("execute code\n\n### `exec_command`\nRun a command.");
+        right[0].payload["input"][0]["tools"][0]["description"] =
+            serde_json::json!("execute code\n\n### `exec_command`\nRun a command in a PTY.");
+
+        let left = build_event_loop_trace(&left);
+        let right = build_event_loop_trace(&right);
+
+        assert_eq!(
+            left.summary.initial_code_mode_tools,
+            right.summary.initial_code_mode_tools
+        );
+        assert_ne!(
+            left.summary.initial_code_mode_tool_definitions,
+            right.summary.initial_code_mode_tool_definitions
         );
     }
 
