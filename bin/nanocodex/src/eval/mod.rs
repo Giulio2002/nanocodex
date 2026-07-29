@@ -3,7 +3,6 @@ mod compare;
 mod diff;
 mod inspect;
 mod run;
-mod vm_network;
 
 use std::{
     collections::BTreeMap,
@@ -423,7 +422,7 @@ async fn prepare_tasks(
     let runtime_started = Instant::now();
     let runtime_image = run::prepare_vm_guest_runtime().await?;
     let runtime_duration = runtime_started.elapsed();
-    let builder = run::eval_vm_image_builder(&vmm, &runtime_image);
+    let builder = nanocodex_eval::vm::image_builder(&vmm, &runtime_image);
     let mut cache_hits = 0_usize;
     let mut cache_creations = 0_usize;
     let mut failures = Vec::new();

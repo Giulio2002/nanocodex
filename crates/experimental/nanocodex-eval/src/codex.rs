@@ -1014,7 +1014,6 @@ impl CodexTranscript {
             tool_wall_duration_ns: 0,
             usage: usage.clone(),
             warmup_usage: UsageTotals::default(),
-            _last_response_id: None,
             cost_usd: None,
             cost_status: if self.usage.is_some() {
                 "usage_reported_unpriced"

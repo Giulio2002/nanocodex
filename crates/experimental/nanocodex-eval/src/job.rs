@@ -13,12 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     EvalError,
-    durable::{DurableTrialError, scan_manifest_trials},
+    durable::scan_manifest_trials,
     sweep::{RunCoordinate, RunManifest},
 };
 
 const JOB_FILE: &str = "job.json";
-const LOCK_FILE: &str = ".nanoeval.lock";
+const LOCK_FILE: &str = ".nanocodex-eval.lock";
 const RUN_FILE: &str = "run.json";
 
 /// Stable metadata and native storage for one reusable evaluator.
@@ -73,8 +73,6 @@ impl EvalJob {
     ) -> Result<Self, EvalError> {
         let parent_directory = prepare_parent_directory(parent_directory)?;
         let mut candidates = Vec::new();
-        let mut incompatible = Vec::new();
-        let mut saw_compatible_schema = false;
         for entry in fs::read_dir(&parent_directory)? {
             let entry = entry?;
             let directory = entry.path();
@@ -87,39 +85,11 @@ impl EvalJob {
             let Ok(retained) = Self::read_json::<RunManifest>(&directory.join(RUN_FILE)) else {
                 continue;
             };
-            if let Some((found, expected)) = retained.incompatible_digest_schema(run) {
-                incompatible.push((identity.started_at, directory, found, expected));
+            if retained != *run {
                 continue;
             }
-            if retained.has_compatible_coordinates(run) {
-                saw_compatible_schema = true;
-            }
-            if !retained.is_compatible_with(run) {
-                continue;
-            }
-            let trials = match scan_manifest_trials(&directory, identity.id, run) {
-                Ok(trials) => trials,
-                Err(DurableTrialError::TaskContentDigestMismatch { task_root, .. })
-                    if retained.task_content_digest(&task_root).is_none() =>
-                {
-                    continue;
-                }
-                Err(DurableTrialError::TaskContentDigestSchemaMismatch { .. })
-                    if retained.task_digest_schema().is_none() =>
-                {
-                    continue;
-                }
-                Err(error) => {
-                    return Err(EvalError::InvalidDurableTrial(error.to_string()));
-                }
-            };
-            if retained.missing_content_digest_roots().any(|task_root| {
-                !trials
-                    .iter()
-                    .any(|trial| trial.coordinate().task_root() == task_root)
-            }) {
-                continue;
-            }
+            let trials = scan_manifest_trials(&directory, identity.id, run)
+                .map_err(|error| EvalError::InvalidDurableTrial(error.to_string()))?;
             let completed = trials.len();
             if completed < run.attempt_count() {
                 candidates.push((identity.started_at, identity, directory));
@@ -128,16 +98,6 @@ impl EvalJob {
         candidates.sort_unstable_by_key(|(started_at, _, _)| *started_at);
 
         let Some((_, identity, directory)) = candidates.pop() else {
-            if !saw_compatible_schema {
-                incompatible.sort_unstable_by_key(|(started_at, _, _, _)| *started_at);
-                if let Some((_, path, found, expected)) = incompatible.pop() {
-                    return Err(EvalError::RunDigestSchemaIncompatible {
-                        path,
-                        found,
-                        expected,
-                    });
-                }
-            }
             return Self::create(&parent_directory);
         };
         let lease = Self::lease(&directory).map_err(|error| match error {
@@ -238,19 +198,7 @@ impl EvalJob {
         if retained == *expected {
             return Ok(());
         }
-        if !retained.is_compatible_with(expected) {
-            return Err(EvalError::RunConflict(path.to_path_buf()));
-        }
-
-        let directory = path
-            .parent()
-            .ok_or_else(|| EvalError::RunConflict(path.to_path_buf()))?;
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer_pretty(&mut temporary, expected)?;
-        temporary.write_all(b"\n")?;
-        temporary.as_file().sync_all()?;
-        temporary.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        Err(EvalError::RunConflict(path.to_path_buf()))
     }
 
     fn lease(directory: &Path) -> Result<JobLease, EvalError> {
@@ -589,44 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn resumes_a_legacy_manifest_without_task_names() {
-        let output = tempdir().unwrap();
-        let run = sweep(2).manifest();
-        let legacy = manifest_with_task_name(&run, None);
-        let first = EvalJob::create(output.path()).unwrap();
-        first.bind_run(&legacy).unwrap();
-        let first_id = first.id();
-        drop(first);
-
-        let resumed = EvalJob::resume_or_create(output.path(), &run).unwrap();
-        assert!(resumed.resumed());
-        assert_eq!(resumed.id(), first_id);
-        resumed.bind_run(&run).unwrap();
-    }
-
-    #[test]
-    fn digestless_manifest_without_a_terminal_lock_is_not_resumed() {
-        let output = tempdir().unwrap();
-        let run = sweep(2).manifest();
-        let legacy = manifest_without_task_digest(&run);
-        let first = EvalJob::create(output.path()).unwrap();
-        first.bind_run(&legacy).unwrap();
-        let first_id = first.id();
-        drop(first);
-
-        let fresh = EvalJob::resume_or_create(output.path(), &run).unwrap();
-        assert!(!fresh.resumed());
-        assert_ne!(fresh.id(), first_id);
-    }
-
-    #[test]
-    fn unversioned_digestful_manifest_requires_an_explicit_fresh_run() {
+    fn outdated_manifest_is_not_resumed() {
         let output = tempdir().unwrap();
         let run = sweep(2).manifest();
         let first = EvalJob::create(output.path()).unwrap();
         first.bind_run(&run).unwrap();
-        let first_directory = first.directory().to_path_buf();
-        let run_path = first_directory.join(RUN_FILE);
+        let first_id = first.id();
+        let run_path = first.directory().join(RUN_FILE);
         let mut retained: serde_json::Value =
             serde_json::from_slice(&fs::read(&run_path).unwrap()).unwrap();
         retained
@@ -634,61 +551,6 @@ mod tests {
             .unwrap()
             .remove("task_digest_schema");
         fs::write(&run_path, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
-        drop(first);
-
-        let error = EvalJob::resume_or_create(output.path(), &run).unwrap_err();
-
-        assert!(matches!(
-            error,
-            EvalError::RunDigestSchemaIncompatible {
-                path,
-                ref found,
-                ref expected,
-            } if path == first_directory
-                && found == "unversioned"
-                && expected == crate::digest::PACKAGE_DIGEST_SCHEMA
-        ));
-    }
-
-    #[test]
-    fn terminal_lock_can_prove_a_digestless_legacy_manifest() {
-        let output = tempdir().unwrap();
-        let sweep = sweep(2);
-        let run = sweep.manifest();
-        let legacy = manifest_without_task_digest(&run);
-        let first = EvalJob::create(output.path()).unwrap();
-        first.bind_run(&legacy).unwrap();
-        write_terminal_trial(&first, &sweep);
-        let first_id = first.id();
-        drop(first);
-
-        let resumed = EvalJob::resume_or_create(output.path(), &run).unwrap();
-        assert!(resumed.resumed());
-        assert_eq!(resumed.id(), first_id);
-        resumed.bind_run(&run).unwrap();
-        let upgraded: RunManifest =
-            serde_json::from_slice(&fs::read(resumed.directory().join(RUN_FILE)).unwrap()).unwrap();
-        assert_eq!(upgraded, run);
-    }
-
-    #[test]
-    fn unversioned_terminal_lock_cannot_prove_a_digestless_legacy_manifest() {
-        let output = tempdir().unwrap();
-        let sweep = sweep(2);
-        let run = sweep.manifest();
-        let legacy = manifest_without_task_digest(&run);
-        let first = EvalJob::create(output.path()).unwrap();
-        first.bind_run(&legacy).unwrap();
-        let trial = write_terminal_trial(&first, &sweep);
-        let lock = trial.join("lock.json");
-        let mut retained: serde_json::Value =
-            serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
-        retained["nanocodex"]
-            .as_object_mut()
-            .unwrap()
-            .remove("materialization_digest_schema");
-        fs::write(lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
-        let first_id = first.id();
         drop(first);
 
         let fresh = EvalJob::resume_or_create(output.path(), &run).unwrap();
@@ -716,7 +578,7 @@ mod tests {
         .unwrap();
         let changed = sweep_for_task(Task::load(task_root.path()).unwrap(), 2);
         let changed_run = changed.manifest();
-        assert!(!original_run.is_compatible_with(&changed_run));
+        assert_ne!(original_run, changed_run);
 
         let fresh = EvalJob::resume_or_create(output.path(), &changed_run).unwrap();
         assert!(!fresh.resumed());
@@ -727,7 +589,7 @@ mod tests {
     fn does_not_resume_a_task_renamed_at_the_same_root() {
         let output = tempdir().unwrap();
         let run = sweep(2).manifest();
-        let renamed = manifest_with_task_name(&run, Some("nanoeval/renamed-task"));
+        let renamed = manifest_with_task_name(&run, "nanoeval/renamed-task");
         let first = EvalJob::create(output.path()).unwrap();
         first.bind_run(&run).unwrap();
         let first_id = first.id();
@@ -793,27 +655,10 @@ mod tests {
             .unwrap()
     }
 
-    fn manifest_with_task_name(run: &RunManifest, name: Option<&str>) -> RunManifest {
+    fn manifest_with_task_name(run: &RunManifest, name: &str) -> RunManifest {
         let mut retained = serde_json::to_value(run).unwrap();
         let task = retained["tasks"][0].as_object_mut().unwrap();
-        if let Some(name) = name {
-            task.insert("name".to_owned(), serde_json::json!(name));
-        } else {
-            task.remove("name");
-        }
-        serde_json::from_value(retained).unwrap()
-    }
-
-    fn manifest_without_task_digest(run: &RunManifest) -> RunManifest {
-        let mut retained = serde_json::to_value(run).unwrap();
-        retained
-            .as_object_mut()
-            .unwrap()
-            .remove("task_digest_schema");
-        retained["tasks"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("content_digest");
+        task.insert("name".to_owned(), serde_json::json!(name));
         serde_json::from_value(retained).unwrap()
     }
 

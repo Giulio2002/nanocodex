@@ -8,6 +8,11 @@ trajectories, timing, usage, and results.
 Harbor-compatible JSONL and ATIF are output formats. Harbor does not run the
 task, agent, VM, or verifier.
 
+Local eval artifacts use one current schema. Resume requires an exact current
+run manifest, and rerun requires the current invocation record. The crate does
+not decode or upgrade old nanoeval run directories; start a new job instead.
+The published-Harbor reader is a separate external-interoperability boundary.
+
 ## VM backend
 
 The benchmark CLI always uses a microVM-backed task environment. The
@@ -20,24 +25,24 @@ Applications install VM execution through the eval facade:
 ```rust,ignore
 use nanocodex_agent::{Nanocodex, OpenAi};
 use nanocodex_eval::{
-    Evaluator, Task,
-    vm::{VmBackend, VmBackendConfiguration, VmEnvironment},
+    Evaluator, Task, VmResources,
+    vm::VmBackend,
 };
 
 let task = Task::load("terminal-bench/tasks/example")?;
 let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?);
+let resources = VmResources::builder(
+    "target/debug/nanocodex",
+    ".cache/vm/runtime.ext4",
+)
+    .task(task.clone())
+    .prepare()
+    .await?;
 let backend = VmBackend::builder()
     .web_search(false)
     .retain_passed_rootfs(false)
     .build();
-backend.configure(
-    VmBackendConfiguration::builder("target/debug/nanocodex", "runtime.ext4")
-        .environment(
-            task.root(),
-            VmEnvironment::new("task-root.ext4", "/app", "/bin/bash"),
-        )
-        .build(),
-)?;
+resources.configure(&backend).await?;
 
 let (evaluator, events) = Evaluator::builder(agent)
     .output_directory(".nanocodex/evals")
@@ -52,6 +57,45 @@ let result = evaluator.task(task).await?;
 `EvaluatorBuilder::vm` sets the durable environment identity to `micro_vm`
 itself. A caller cannot install this backend while accidentally recording the
 attempt as native.
+
+`VmResources` owns OCI image materialization, public-network helper discovery,
+task-to-environment mapping, and verifier-cache preparation. The detailed
+`VmBackendConfiguration` and `VmEnvironment` types remain available under
+`nanocodex_eval::vm` for custom runtimes, but the normal evaluator and
+differential paths do not assemble them.
+
+## Differential runner
+
+`DifferentialEval` owns the matched two-arm lifecycle. The binary supplies the
+already configured Nanocodex recipe, shared auth selection, one prepared VM
+resource set, and executable identities:
+
+```rust,ignore
+use nanocodex_eval::{
+    CodexAuth, DifferentialEval, ExecutableIdentity, Task, VmResources,
+};
+
+let task = Task::load("terminal-bench/tasks/example")?;
+let vm = VmResources::builder("nanocodex", "runtime.ext4")
+    .task(task.clone())
+    .prepare()
+    .await?;
+let report = DifferentialEval::builder(task, nanocodex)
+    .codex("codex-linux", CodexAuth::auth_file("~/.codex/auth.json"))
+    .vm(vm)
+    .thinking(thinking)
+    .web_search(false)
+    .nanocodex_executable(ExecutableIdentity::new("nanocodex", version))
+    .build()?
+    .run()
+    .await?;
+```
+
+The library stages the Codex release, creates matched isolated backends, runs
+both arms concurrently, streams the live divergence record, projects ATIF,
+compares API event loops, and returns one typed retained report. Clap,
+observability installation, process build metadata, terminal formatting, and
+exit-code policy stay in the binary.
 
 ## CLI
 

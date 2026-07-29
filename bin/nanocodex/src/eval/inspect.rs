@@ -10,7 +10,7 @@ use clap::Args;
 use eyre::{Result, eyre};
 use nanocodex_eval::{
     AtifSource, AtifTrajectory, BillingCompleteness, EvalCleanup, EvalOutcome,
-    MeasurementCompleteness, PhaseTiming, UsageTotals, infer_retained_scored,
+    MeasurementCompleteness, PhaseTiming, UsageTotals,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
@@ -443,17 +443,11 @@ struct TrialClassification {
 }
 
 fn trial_classification(
-    outcome: Option<EvalOutcome>,
-    scored: Option<bool>,
+    outcome: EvalOutcome,
+    scored: bool,
     exception_type: Option<&str>,
     verifier: Option<&HarborVerifierResult>,
 ) -> TrialClassification {
-    let scored = infer_retained_scored(
-        scored,
-        outcome,
-        verifier.is_some(),
-        exception_type.is_some(),
-    );
     let passed = scored
         && verifier.is_some_and(|verifier| verifier.rewards.values().all(|reward| *reward > 0.0));
     let (refused, errored) = match exception_type {
@@ -462,15 +456,13 @@ fn trial_classification(
             exception != "CleanupError",
         ),
         None => (
-            outcome == Some(EvalOutcome::SafetyRefusal),
-            outcome.is_some_and(|outcome| {
-                matches!(
-                    outcome,
-                    EvalOutcome::SafetyRefusal
-                        | EvalOutcome::AgentTimeout
-                        | EvalOutcome::InfrastructureError
-                )
-            }),
+            outcome == EvalOutcome::SafetyRefusal,
+            matches!(
+                outcome,
+                EvalOutcome::SafetyRefusal
+                    | EvalOutcome::AgentTimeout
+                    | EvalOutcome::InfrastructureError
+            ),
         ),
     };
     TrialClassification {
@@ -488,8 +480,8 @@ fn trial_classification(
 
 #[cfg(test)]
 fn trial_classification_for_reward(
-    outcome: Option<EvalOutcome>,
-    scored: Option<bool>,
+    outcome: EvalOutcome,
+    scored: bool,
     exception_type: Option<&str>,
     reward: Option<f64>,
 ) -> TrialClassification {
@@ -774,9 +766,8 @@ struct HarborTrialResult {
     trial_name: String,
     agent_result: Option<HarborAgentResult>,
     verifier_result: Option<HarborVerifierResult>,
-    outcome: Option<EvalOutcome>,
-    scored: Option<bool>,
-    #[serde(default)]
+    outcome: EvalOutcome,
+    scored: bool,
     cleanup: EvalCleanup,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
@@ -950,7 +941,12 @@ mod tests {
     #[test]
     fn refusals_overlap_the_error_axis() {
         assert_eq!(
-            trial_classification_for_reward(None, None, Some("AgentSafetyRefusalError"), None),
+            trial_classification_for_reward(
+                EvalOutcome::SafetyRefusal,
+                false,
+                Some("AgentSafetyRefusalError"),
+                None,
+            ),
             TrialClassification {
                 score: TrialScoreStatus::Unscored,
                 refused: true,
@@ -958,7 +954,12 @@ mod tests {
             }
         );
         assert_eq!(
-            trial_classification_for_reward(None, None, Some("AgentAuthenticationError"), None),
+            trial_classification_for_reward(
+                EvalOutcome::InfrastructureError,
+                false,
+                Some("AgentAuthenticationError"),
+                None,
+            ),
             TrialClassification {
                 score: TrialScoreStatus::Unscored,
                 refused: false,
@@ -968,10 +969,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_exception_precedes_legacy_outcome_lifecycle_axes() {
+    fn explicit_exception_precedes_the_outcome_lifecycle_axes() {
         let cleanup = trial_classification_for_reward(
-            Some(EvalOutcome::InfrastructureError),
-            Some(false),
+            EvalOutcome::InfrastructureError,
+            false,
             Some("CleanupError"),
             None,
         );
@@ -979,46 +980,44 @@ mod tests {
         assert!(!cleanup.errored);
 
         let explicit_non_refusal = trial_classification_for_reward(
-            Some(EvalOutcome::SafetyRefusal),
-            Some(false),
+            EvalOutcome::SafetyRefusal,
+            false,
             Some("VerifierError"),
             None,
         );
         assert!(!explicit_non_refusal.refused);
         assert!(explicit_non_refusal.errored);
 
-        let legacy_refusal = trial_classification_for_reward(
-            Some(EvalOutcome::SafetyRefusal),
-            Some(false),
-            None,
-            None,
-        );
-        assert!(legacy_refusal.refused);
-        assert!(legacy_refusal.errored);
+        let refusal =
+            trial_classification_for_reward(EvalOutcome::SafetyRefusal, false, None, None);
+        assert!(refusal.refused);
+        assert!(refusal.errored);
     }
 
     #[test]
     fn classifies_scored_trials_from_reward() {
         assert_eq!(
-            trial_classification_for_reward(None, None, None, Some(1.0)).score,
+            trial_classification_for_reward(EvalOutcome::Passed, true, None, Some(1.0)).score,
             TrialScoreStatus::Passed
         );
         assert_eq!(
-            trial_classification_for_reward(None, None, None, Some(0.0)).score,
+            trial_classification_for_reward(EvalOutcome::VerifierFailed, true, None, Some(0.0))
+                .score,
             TrialScoreStatus::Failed
         );
         assert_eq!(
-            trial_classification_for_reward(None, None, None, None).score,
+            trial_classification_for_reward(EvalOutcome::InfrastructureError, false, None, None,)
+                .score,
             TrialScoreStatus::Unscored
         );
         assert_eq!(
-            trial_classification_for_reward(None, Some(false), None, Some(1.0)).score,
+            trial_classification_for_reward(EvalOutcome::Passed, false, None, Some(1.0)).score,
             TrialScoreStatus::Unscored
         );
         assert_eq!(
             trial_classification_for_reward(
-                Some(EvalOutcome::Passed),
-                Some(true),
+                EvalOutcome::Passed,
+                true,
                 Some("CleanupError"),
                 Some(1.0),
             )
@@ -1026,27 +1025,21 @@ mod tests {
             TrialScoreStatus::Passed
         );
         let scored_timeout = trial_classification_for_reward(
-            Some(EvalOutcome::AgentTimeout),
-            Some(true),
+            EvalOutcome::AgentTimeout,
+            true,
             Some("AgentTimeoutError"),
             Some(1.0),
         );
         assert_eq!(scored_timeout.score, TrialScoreStatus::Passed);
         assert!(scored_timeout.errored);
-
         assert_eq!(
             trial_classification_for_reward(
-                Some(EvalOutcome::AgentTimeout),
-                None,
-                None,
+                EvalOutcome::AgentTimeout,
+                false,
+                Some("AgentTimeoutError"),
                 Some(1.0),
             )
             .score,
-            TrialScoreStatus::Unscored
-        );
-        assert_eq!(
-            trial_classification_for_reward(None, None, Some("AgentTimeoutError"), Some(1.0),)
-                .score,
             TrialScoreStatus::Unscored
         );
     }
@@ -1065,6 +1058,7 @@ mod tests {
                 "effort": "medium",
                 "transport": "responses_websocket_v2",
                 "orchestration": "agent",
+                "runtime_completeness": "observed_lower_bound",
                 "duration_ms": 1,
                 "duration_ns": 1_000_000,
                 "model_calls": 1,
@@ -1075,6 +1069,7 @@ mod tests {
                 "websocket_reconnects": 0,
                 "response_attempts": 1,
                 "response_retries": 0,
+                "billing_uncertain_response_attempts": 1,
                 "connection_duration_ns": 1,
                 "retry_backoff_duration_ns": 0,
                 "model_duration_ns": 0,

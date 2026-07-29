@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// A complete ATIF-v1.7 projection of one agent attempt.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AtifTrajectory {
     /// Schema revision used to encode this trajectory.
     pub schema_version: AtifSchemaVersion,
@@ -22,86 +22,6 @@ pub struct AtifTrajectory {
     pub steps: Vec<AtifStep>,
     /// Aggregate attempt metrics.
     pub final_metrics: AtifFinalMetrics,
-}
-
-#[derive(Deserialize)]
-struct AtifTrajectoryWire {
-    schema_version: AtifSchemaVersion,
-    session_id: String,
-    agent: AtifAgent,
-    steps: Vec<AtifStep>,
-    final_metrics: AtifFinalMetricsWire,
-}
-
-#[derive(Deserialize)]
-struct AtifFinalMetricsWire {
-    total_prompt_tokens: u64,
-    total_completion_tokens: u64,
-    total_cached_tokens: u64,
-    total_cost_usd: Option<f64>,
-    total_steps: u32,
-    extra: AtifFinalMetricsExtraWire,
-}
-
-#[derive(Deserialize)]
-struct AtifFinalMetricsExtraWire {
-    model_calls: u32,
-    tool_calls: u32,
-    duration_ns: u64,
-    #[serde(default)]
-    billing_completeness: Option<BillingCompleteness>,
-    #[serde(default)]
-    usage_completeness: Option<MeasurementCompleteness>,
-    #[serde(default)]
-    runtime_completeness: Option<MeasurementCompleteness>,
-    #[serde(flatten)]
-    runtime: AtifRuntimeMetrics,
-}
-
-impl From<AtifTrajectoryWire> for AtifTrajectory {
-    fn from(trajectory: AtifTrajectoryWire) -> Self {
-        let terminal_runtime_completeness = trajectory.steps.iter().rev().find_map(|step| {
-            step.extra
-                .as_ref()
-                .map(|extra| extra.terminal_payload.runtime_completeness)
-        });
-        let extra = trajectory.final_metrics.extra;
-        let runtime_completeness = extra
-            .runtime_completeness
-            .or(terminal_runtime_completeness)
-            .unwrap_or(MeasurementCompleteness::ObservedLowerBound);
-        Self {
-            schema_version: trajectory.schema_version,
-            session_id: trajectory.session_id,
-            agent: trajectory.agent,
-            steps: trajectory.steps,
-            final_metrics: AtifFinalMetrics {
-                total_prompt_tokens: trajectory.final_metrics.total_prompt_tokens,
-                total_completion_tokens: trajectory.final_metrics.total_completion_tokens,
-                total_cached_tokens: trajectory.final_metrics.total_cached_tokens,
-                total_cost_usd: trajectory.final_metrics.total_cost_usd,
-                total_steps: trajectory.final_metrics.total_steps,
-                extra: AtifFinalMetricsExtra {
-                    model_calls: extra.model_calls,
-                    tool_calls: extra.tool_calls,
-                    duration_ns: extra.duration_ns,
-                    billing_completeness: extra.billing_completeness,
-                    usage_completeness: extra.usage_completeness,
-                    runtime_completeness,
-                    runtime: extra.runtime,
-                },
-            },
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for AtifTrajectory {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        AtifTrajectoryWire::deserialize(deserializer).map(Self::from)
-    }
 }
 
 impl AtifTrajectory {
@@ -329,15 +249,12 @@ pub struct AtifFinalMetricsExtra {
     pub duration_ns: u64,
     /// Whether every potentially billable model operation reached a terminal
     /// provider usage event.
-    #[serde(default)]
     pub billing_completeness: Option<BillingCompleteness>,
     /// Whether aggregate token counts are complete, observed lower bounds, or
     /// absent (`None`).
-    #[serde(default)]
     pub usage_completeness: Option<MeasurementCompleteness>,
     /// Whether runtime counters and durations are exact or observed lower
     /// bounds.
-    #[serde(default = "legacy_runtime_completeness")]
     pub runtime_completeness: MeasurementCompleteness,
     /// Detailed transport and runtime metrics.
     #[serde(flatten)]
@@ -352,18 +269,14 @@ pub struct AtifRuntimeMetrics {
     /// Successful WebSocket replacements.
     pub websocket_reconnects: u32,
     /// Complete Responses transport attempts.
-    #[serde(default)]
     pub response_attempts: u32,
     /// Retried Responses attempts.
-    #[serde(default)]
     pub response_retries: u32,
     /// Potentially billable sent attempts whose provider usage was unavailable.
-    #[serde(default, alias = "accepted_abandoned_response_attempts")]
     pub billing_uncertain_response_attempts: u32,
     /// Time spent establishing Responses connections.
     pub connection_duration_ns: u64,
     /// Time spent inside owned retry backoff.
-    #[serde(default)]
     pub retry_backoff_duration_ns: u64,
     /// Time spent inside model calls.
     pub model_duration_ns: u64,
@@ -379,10 +292,6 @@ pub struct AtifRuntimeMetrics {
     pub cache_write_input_tokens: u64,
     /// Provider-reported reasoning output tokens.
     pub reasoning_output_tokens: u64,
-}
-
-const fn legacy_runtime_completeness() -> MeasurementCompleteness {
-    MeasurementCompleteness::ObservedLowerBound
 }
 
 /// Explicit streaming projection from typed Nanocodex events into ATIF.
@@ -870,13 +779,11 @@ struct ToolResultPayload {
 mod tests {
     use std::path::Path;
 
-    use nanocodex_agent::events::AgentEvent;
-    use serde_json::Value;
-
     use crate::{
         AgentMetadata, AgentResult, AgentStatus, AtifSource, BillingCompleteness,
         MeasurementCompleteness, Task,
     };
+    use nanocodex_agent::events::AgentEvent;
 
     use super::AtifBuilder;
 
@@ -990,14 +897,6 @@ mod tests {
             decoded.final_metrics.extra.usage_completeness,
             Some(MeasurementCompleteness::Complete)
         );
-        assert_eq!(
-            decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap())
-                .final_metrics
-                .extra
-                .runtime_completeness,
-            MeasurementCompleteness::Complete
-        );
-
         let mut partial_builder = AtifBuilder::default();
         for event in &events {
             partial_builder.apply(event).unwrap();
@@ -1011,14 +910,6 @@ mod tests {
             partial.final_metrics.extra.usage_completeness,
             Some(MeasurementCompleteness::ObservedLowerBound)
         );
-        assert_eq!(
-            decode_legacy_runtime(serde_json::to_value(&partial).unwrap())
-                .final_metrics
-                .extra
-                .runtime_completeness,
-            MeasurementCompleteness::ObservedLowerBound
-        );
-
         let mut failed = result.clone();
         failed.metadata.status = AgentStatus::Failed;
         failed.metadata.runtime_completeness = MeasurementCompleteness::ObservedLowerBound;
@@ -1047,19 +938,6 @@ mod tests {
                 .map(|extra| extra.terminal_event_type.as_str()),
             Some("run.failed")
         );
-        let legacy_failed = decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap());
-        assert_eq!(
-            legacy_failed.final_metrics.extra.runtime_completeness,
-            MeasurementCompleteness::ObservedLowerBound
-        );
-        assert_eq!(
-            legacy_failed.steps[2]
-                .extra
-                .as_ref()
-                .map(|extra| extra.terminal_payload.runtime_completeness),
-            Some(MeasurementCompleteness::ObservedLowerBound)
-        );
-
         let mut cancelled = result;
         cancelled.metadata.status = AgentStatus::Cancelled;
         cancelled.metadata.runtime_completeness = MeasurementCompleteness::ObservedLowerBound;
@@ -1073,30 +951,6 @@ mod tests {
                 .map(|extra| extra.terminal_event_type.as_str()),
             Some("run.failed")
         );
-        assert_eq!(
-            decode_legacy_runtime(serde_json::to_value(&trajectory).unwrap())
-                .final_metrics
-                .extra
-                .runtime_completeness,
-            MeasurementCompleteness::ObservedLowerBound
-        );
-    }
-
-    fn decode_legacy_runtime(mut trajectory: Value) -> crate::AtifTrajectory {
-        trajectory["final_metrics"]["extra"]
-            .as_object_mut()
-            .unwrap()
-            .remove("runtime_completeness");
-        for step in trajectory["steps"].as_array_mut().unwrap() {
-            if let Some(terminal) = step
-                .get_mut("extra")
-                .and_then(|extra| extra.get_mut("terminal_payload"))
-                .and_then(Value::as_object_mut)
-            {
-                terminal.remove("runtime_completeness");
-            }
-        }
-        serde_json::from_value(trajectory).unwrap()
     }
 
     fn event(seq: u64, kind: &str, payload: &str) -> AgentEvent {
@@ -1112,6 +966,7 @@ mod tests {
         "effort":"low",
         "transport":"responses_websocket_v2",
         "orchestration":"local_code_mode",
+        "runtime_completeness":"complete",
         "duration_ms":1,
         "duration_ns":30,
         "model_calls":2,
@@ -1122,6 +977,7 @@ mod tests {
         "websocket_reconnects":0,
         "response_attempts":2,
         "response_retries":0,
+        "billing_uncertain_response_attempts":0,
         "connection_duration_ns":1,
         "retry_backoff_duration_ns":0,
         "model_duration_ns":30,

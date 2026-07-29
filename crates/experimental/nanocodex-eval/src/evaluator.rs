@@ -339,20 +339,6 @@ pub enum EvalError {
     #[error("evaluation job is already bound to a different run: {0}")]
     RunConflict(PathBuf),
 
-    /// A resumable job uses an incompatible task digest algorithm.
-    #[error(
-        "evaluation job {path} uses task digest schema `{found}`; expected `{expected}`; \
-         start an explicit fresh run to cross this recovery boundary"
-    )]
-    RunDigestSchemaIncompatible {
-        /// Retained job whose task identity cannot be compared safely.
-        path: PathBuf,
-        /// Retained schema label.
-        found: String,
-        /// Current schema label.
-        expected: String,
-    },
-
     /// A retained terminal result did not belong to its finite run.
     #[error("invalid durable evaluation trial: {0}")]
     InvalidDurableTrial(String),
@@ -1964,7 +1950,6 @@ impl AgentObservation {
             tool_wall_duration_ns: 0,
             usage: self.completed.usage.clone(),
             warmup_usage: self.completed.warmup_usage.clone(),
-            _last_response_id: None,
             cost_usd,
             cost_status: CostStatus::UsageNotReported.as_str().to_owned(),
             estimated_cost: None,
@@ -2512,7 +2497,6 @@ fn failure_kind(error: &EvalError) -> EvalExceptionKind {
         | EvalError::Io(_)
         | EvalError::Json(_)
         | EvalError::RunConflict(_)
-        | EvalError::RunDigestSchemaIncompatible { .. }
         | EvalError::RunActive(_)
         | EvalError::MissingSweepCoordinate => EvalExceptionKind::Internal,
     }
@@ -3018,8 +3002,9 @@ impl AgentResult {
         if !event.kind.is_terminal() {
             return Err(EvalError::AgentEventsClosed);
         }
-        let metadata: AgentMetadata =
+        let metadata: AgentTerminalMetadata =
             serde_json::from_str(event.payload.get()).map_err(EvalError::AgentTerminal)?;
+        let metadata = metadata.into_retained();
         let billing_completeness = if metadata.billing_uncertain_response_attempts > 0
             || metadata.cost_status == ESTIMATED_LOWER_BOUND_COST_STATUS
         {
@@ -3038,6 +3023,84 @@ impl AgentResult {
             billing_completeness,
             metadata,
         })
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentTerminalMetadata {
+    status: AgentStatus,
+    model: String,
+    effort: String,
+    #[serde(default)]
+    reasoning_mode: Option<String>,
+    transport: String,
+    orchestration: String,
+    duration_ms: u64,
+    duration_ns: u64,
+    model_calls: u32,
+    steers: u32,
+    compactions: u32,
+    tool_calls: u32,
+    connection_attempts: u32,
+    websocket_reconnects: u32,
+    response_attempts: u32,
+    response_retries: u32,
+    #[serde(default)]
+    billing_uncertain_response_attempts: u32,
+    connection_duration_ns: u64,
+    retry_backoff_duration_ns: u64,
+    model_duration_ns: u64,
+    warmup_duration_ns: u64,
+    tool_work_duration_ns: u64,
+    tool_wall_duration_ns: u64,
+    usage: UsageTotals,
+    warmup_usage: UsageTotals,
+    #[serde(default, rename = "last_response_id")]
+    _last_response_id: Option<String>,
+    cost_usd: Option<f64>,
+    cost_status: String,
+    #[serde(default)]
+    estimated_cost: Option<nanocodex_oai_api::pricing::EstimatedUsdCost>,
+}
+
+impl AgentTerminalMetadata {
+    fn into_retained(self) -> AgentMetadata {
+        let runtime_completeness = if self.status == AgentStatus::Completed {
+            crate::MeasurementCompleteness::Complete
+        } else {
+            crate::MeasurementCompleteness::ObservedLowerBound
+        };
+        AgentMetadata {
+            status: self.status,
+            model: self.model,
+            effort: self.effort,
+            reasoning_mode: self.reasoning_mode,
+            transport: self.transport,
+            orchestration: self.orchestration,
+            runtime_completeness,
+            duration_ms: self.duration_ms,
+            duration_ns: self.duration_ns,
+            model_calls: self.model_calls,
+            steers: self.steers,
+            compactions: self.compactions,
+            tool_calls: self.tool_calls,
+            connection_attempts: self.connection_attempts,
+            websocket_reconnects: self.websocket_reconnects,
+            response_attempts: self.response_attempts,
+            response_retries: self.response_retries,
+            billing_uncertain_response_attempts: self.billing_uncertain_response_attempts,
+            connection_duration_ns: self.connection_duration_ns,
+            retry_backoff_duration_ns: self.retry_backoff_duration_ns,
+            model_duration_ns: self.model_duration_ns,
+            warmup_duration_ns: self.warmup_duration_ns,
+            tool_work_duration_ns: self.tool_work_duration_ns,
+            tool_wall_duration_ns: self.tool_wall_duration_ns,
+            usage: self.usage,
+            warmup_usage: self.warmup_usage,
+            cost_usd: self.cost_usd,
+            cost_status: self.cost_status,
+            estimated_cost: self.estimated_cost,
+        }
     }
 }
 
@@ -4644,21 +4707,17 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn retained_terminal_metadata_accepts_legacy_billing_field_and_writes_new_name() {
+    fn retained_terminal_metadata_requires_the_current_billing_field() {
         let mut payload = terminal_payload(1, 0.25);
-        payload
-            .as_object_mut()
-            .unwrap()
-            .insert("accepted_abandoned_response_attempts".to_owned(), json!(2));
+        let fields = payload.as_object_mut().unwrap();
+        fields.remove("billing_uncertain_response_attempts");
+        fields.insert("accepted_abandoned_response_attempts".to_owned(), json!(2));
 
-        let metadata: crate::AgentMetadata = serde_json::from_value(payload).unwrap();
-        assert_eq!(metadata.billing_uncertain_response_attempts, 2);
-        let encoded = serde_json::to_value(metadata).unwrap();
-        assert_eq!(encoded["billing_uncertain_response_attempts"], 2);
+        let error = serde_json::from_value::<crate::AgentMetadata>(payload).unwrap_err();
         assert!(
-            encoded
-                .get("accepted_abandoned_response_attempts")
-                .is_none()
+            error
+                .to_string()
+                .contains("billing_uncertain_response_attempts")
         );
     }
 
@@ -4699,6 +4758,7 @@ mod lifecycle_tests {
             "effort": "high",
             "transport": "websocket",
             "orchestration": "agent",
+            "runtime_completeness": "complete",
             "duration_ms": 5,
             "duration_ns": 5_000_000,
             "model_calls": model_calls,
@@ -4709,6 +4769,7 @@ mod lifecycle_tests {
             "websocket_reconnects": 0,
             "response_attempts": 1,
             "response_retries": 0,
+            "billing_uncertain_response_attempts": 0,
             "connection_duration_ns": 1,
             "retry_backoff_duration_ns": 0,
             "model_duration_ns": 4,

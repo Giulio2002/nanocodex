@@ -8,10 +8,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     ffi::OsStr,
     fs,
     future::Future,
     io,
+    io::Read as _,
     num::ParseFloatError,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -55,7 +57,7 @@ pub use nanocodex_vm::{
 use crate::{
     AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, CleanupPhase,
     CodexExec, EvalAttempt, EvalEnvironment, EvaluatorBuilder, NetworkPolicy, Task, TaskLoadError,
-    VerifierResult,
+    VerifierEnvironmentMode, VerifierResult,
 };
 
 const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
@@ -93,6 +95,434 @@ const GUEST_PUBLIC_RESOLV_CONF: &str =
 const VERIFIER_NETWORK_RETRIES: usize = 4;
 const VERIFIER_NETWORK_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const GVPROXY_VERSION: &str = "v0.8.9";
+const EVAL_IMAGE_RUN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// Prepared VM resources shared by every attempt in one evaluation run.
+///
+/// Use [`VmResources::builder`] to select tasks and deliberate cache policy.
+/// Image materialization, network helper discovery, task-to-environment
+/// mapping, and backend configuration remain owned by this type.
+pub struct VmResources {
+    vmm: PathBuf,
+    runtime_image: PathBuf,
+    tasks: Vec<Task>,
+    environments: BTreeMap<PathBuf, VmEnvironment>,
+    gvproxy: Option<PathBuf>,
+    verifier_cache: PathBuf,
+}
+
+/// Deliberate policy for preparing [`VmResources`].
+pub struct VmResourcesBuilder {
+    vmm: PathBuf,
+    runtime_image: PathBuf,
+    tasks: Vec<Task>,
+    rootfs: Option<PathBuf>,
+    cache: PathBuf,
+    cache_policy: CachePolicy,
+    gvproxy: Option<PathBuf>,
+}
+
+impl VmResources {
+    /// Starts a resource recipe around one VMM executable and guest-runtime disk.
+    #[must_use]
+    pub fn builder(
+        vmm: impl Into<PathBuf>,
+        runtime_image: impl Into<PathBuf>,
+    ) -> VmResourcesBuilder {
+        VmResourcesBuilder {
+            vmm: vmm.into(),
+            runtime_image: runtime_image.into(),
+            tasks: Vec::new(),
+            rootfs: None,
+            cache: PathBuf::from(DEFAULT_VM_CACHE),
+            cache_policy: CachePolicy::Reuse,
+            gvproxy: None,
+        }
+    }
+
+    /// Configures a fresh backend from these prepared resources.
+    ///
+    /// Reusable verifier dependency caches are prepared before the backend is
+    /// returned, so admitting an attempt cannot observe a partially prepared
+    /// run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when immutable backend configuration or verifier-cache
+    /// preparation fails.
+    pub async fn backend(&self, builder: VmBackendBuilder) -> Result<VmBackend, VmResourcesError> {
+        let backend = builder.build();
+        self.configure(&backend).await?;
+        Ok(backend)
+    }
+
+    /// Installs these resources into an existing unconfigured backend.
+    ///
+    /// This form supports evaluators that create their durable job directory
+    /// before image preparation. The backend is still configured exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when immutable backend configuration or verifier-cache
+    /// preparation fails.
+    pub async fn configure(&self, backend: &VmBackend) -> Result<(), VmResourcesError> {
+        let mut configuration = VmBackendConfiguration::builder(&self.vmm, &self.runtime_image)
+            .environments(self.environments.clone())
+            .verifier_cache(&self.verifier_cache);
+        if let Some(gvproxy) = &self.gvproxy {
+            configuration = configuration.gvproxy(gvproxy);
+        }
+        backend.configure(configuration.build())?;
+        backend.prepare_verifier_caches(&self.tasks).await?;
+        Ok(())
+    }
+
+    /// Returns the prepared environment for one task package.
+    ///
+    /// This detailed accessor is intended for custom guest agents such as the
+    /// stock-Codex differential arm. Normal Nanocodex evaluators only need
+    /// [`Self::backend`].
+    #[must_use]
+    pub fn environment(&self, task: &Task) -> Option<&VmEnvironment> {
+        self.environments.get(task.root())
+    }
+}
+
+impl VmResourcesBuilder {
+    /// Adds one task to this VM run.
+    #[must_use]
+    pub fn task(mut self, task: Task) -> Self {
+        self.tasks.push(task);
+        self
+    }
+
+    /// Adds every task to this VM run.
+    #[must_use]
+    pub fn tasks(mut self, tasks: impl IntoIterator<Item = Task>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
+    /// Uses one already prepared root filesystem for every selected task.
+    ///
+    /// A raw ext4 image uses `/app`; a directory root uses `/workspace`.
+    #[must_use]
+    pub fn rootfs(mut self, rootfs: impl Into<PathBuf>) -> Self {
+        self.rootfs = Some(rootfs.into());
+        self
+    }
+
+    /// Selects the content-addressed image and verifier-cache directory.
+    #[must_use]
+    pub fn cache_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.cache = directory.into();
+        self
+    }
+
+    /// Selects whether OCI image references may reuse their local resolution.
+    #[must_use]
+    pub const fn cache_policy(mut self, policy: CachePolicy) -> Self {
+        self.cache_policy = policy;
+        self
+    }
+
+    /// Pins the gvproxy executable used by tasks that request public network.
+    ///
+    /// When omitted, preparation discovers an installed executable or fetches
+    /// the pinned evaluator release into the VM cache.
+    #[must_use]
+    pub fn gvproxy(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.gvproxy = Some(executable.into());
+        self
+    }
+
+    /// Materializes immutable resources for the complete task set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty task set, unsupported Compose topology,
+    /// invalid overrides, image preparation failures, or network helper
+    /// failures.
+    pub async fn prepare(self) -> Result<VmResources, VmResourcesError> {
+        if self.tasks.is_empty() {
+            return Err(VmResourcesError::NoTasks);
+        }
+        if let Some(task) = self.tasks.iter().find(|task| task.requires_compose()) {
+            return Err(VmResourcesError::Compose(task.name().to_owned()));
+        }
+        let environments = if let Some(rootfs) = self.rootfs {
+            if !rootfs.exists() {
+                return Err(VmResourcesError::InvalidRootfs(rootfs));
+            }
+            let workspace = if rootfs.is_file() {
+                "/app"
+            } else {
+                "/workspace"
+            };
+            let environment = VmEnvironment::new(rootfs, workspace, "bash");
+            self.tasks
+                .iter()
+                .map(|task| (task.root().to_path_buf(), environment.clone()))
+                .collect()
+        } else {
+            let image_builder = image_builder(&self.vmm, &self.runtime_image);
+            prepare_vm_environments(&self.tasks, &self.cache, self.cache_policy, &image_builder)
+                .await?
+        };
+        let public_network = self
+            .tasks
+            .iter()
+            .any(|task| task.network() == NetworkPolicy::Public);
+        let gvproxy = if public_network {
+            match self.gvproxy {
+                Some(path) if path.is_file() => Some(path),
+                Some(path) => return Err(VmResourcesError::InvalidGvproxy(path)),
+                None => Some(prepare_gvproxy(&self.cache).await?),
+            }
+        } else {
+            None
+        };
+        Ok(VmResources {
+            vmm: self.vmm,
+            runtime_image: self.runtime_image,
+            tasks: self.tasks,
+            environments,
+            gvproxy,
+            verifier_cache: self.cache,
+        })
+    }
+}
+
+/// Failure while preparing or installing one VM evaluation resource set.
+#[derive(Debug, thiserror::Error)]
+pub enum VmResourcesError {
+    /// No task was selected.
+    #[error("a VM evaluation requires at least one task")]
+    NoTasks,
+
+    /// The single-guest backend cannot reproduce a Compose topology.
+    #[error(
+        "task {0} requires a custom Docker Compose topology; the single-guest eval backend does not implement Compose tasks"
+    )]
+    Compose(String),
+
+    /// A root filesystem override did not exist.
+    #[error("VM rootfs override does not exist: {0}")]
+    InvalidRootfs(PathBuf),
+
+    /// A pinned network helper was not a regular file.
+    #[error("gvproxy override does not name a file: {0}")]
+    InvalidGvproxy(PathBuf),
+
+    /// The pinned network helper is unavailable for this host.
+    #[error("gvproxy is not published for {os}/{architecture}")]
+    UnsupportedPlatform {
+        /// Host operating system.
+        os: &'static str,
+        /// Host architecture.
+        architecture: &'static str,
+    },
+
+    /// Fetching the pinned network helper failed.
+    #[error("failed to download gvproxy: curl exited with {0}")]
+    NetworkDownload(std::process::ExitStatus),
+
+    /// The fetched network helper did not match its pinned digest.
+    #[error("downloaded gvproxy digest was {actual}, expected {expected}")]
+    NetworkDigest {
+        /// Pinned digest.
+        expected: &'static str,
+        /// Observed digest.
+        actual: String,
+    },
+
+    /// Task package loading or validation failed.
+    #[error(transparent)]
+    Task(#[from] TaskLoadError),
+
+    /// OCI-to-ext4 image preparation failed.
+    #[error(transparent)]
+    Image(#[from] ImageError),
+
+    /// VM backend configuration failed.
+    #[error(transparent)]
+    Configure(#[from] VmBackendConfigureError),
+
+    /// VM attempt or verifier-cache preparation failed.
+    #[error(transparent)]
+    Attempt(#[from] VmAttemptError),
+
+    /// Host filesystem or subprocess I/O failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// Creates the evaluator's canonical image builder for explicit cache warming.
+///
+/// Normal evaluation consumers should use [`VmResources::builder`]. This
+/// detailed constructor exists for preparation commands that need to report
+/// individual image cache outcomes without admitting attempts.
+#[must_use]
+pub fn image_builder(vmm: &Path, runtime_image: &Path) -> VmImageBuilder {
+    let builder = VmImageBuilder::new(vmm, runtime_image)
+        .vmm_args(["vm-run-config", "--config"])
+        .prefer_ipv4()
+        .run_timeout(EVAL_IMAGE_RUN_TIMEOUT);
+    let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
+    if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
+        builder.firmware_directory(firmware)
+    } else {
+        builder
+    }
+}
+
+async fn prepare_vm_environments(
+    tasks: &[Task],
+    cache: &Path,
+    policy: CachePolicy,
+    builder: &VmImageBuilder,
+) -> Result<BTreeMap<PathBuf, VmEnvironment>, VmResourcesError> {
+    let mut environments = BTreeMap::new();
+    for task in tasks {
+        if environments.contains_key(task.root()) {
+            continue;
+        }
+        task.validate_package()?;
+        let prepared = prepare_task_image(builder, task, cache, policy).await?;
+        task.validate_package()?;
+        let verifier = if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
+            let verifier = prepare_verifier_image(builder, task, cache, policy).await?;
+            task.validate_package()?;
+            info!(
+                target: "nanocodex_eval",
+                task_name = task.name(),
+                oci_manifest_digest = verifier.manifest_digest(),
+                oci_manifest_source = verifier.manifest_source().as_str(),
+                vm_rootfs_cache_status = verifier.disk_status().as_str(),
+                vm_rootfs_path = %verifier.path().display(),
+                "separate verifier VM root disk ready"
+            );
+            Some(
+                VmVerifierEnvironment::new(verifier.path(), verifier.workdir(), verifier.shell())
+                    .environment(verifier.environment().clone()),
+            )
+        } else {
+            None
+        };
+        info!(
+            target: "nanocodex_eval",
+            task_name = task.name(),
+            oci_manifest_digest = prepared.manifest_digest(),
+            oci_manifest_source = prepared.manifest_source().as_str(),
+            vm_rootfs_cache_status = prepared.disk_status().as_str(),
+            vm_rootfs_path = %prepared.path().display(),
+            "VM root disk ready"
+        );
+        let environment = VmEnvironment::new(prepared.path(), prepared.workdir(), prepared.shell())
+            .environment(prepared.environment().clone());
+        environments.insert(
+            task.root().to_path_buf(),
+            verifier.map_or(environment.clone(), |verifier| {
+                environment.verifier(verifier)
+            }),
+        );
+    }
+    Ok(environments)
+}
+
+async fn prepare_gvproxy(cache: &Path) -> Result<PathBuf, VmResourcesError> {
+    for name in ["NANOCODEX_EVAL_GVPROXY", "NANOEVAL_GVPROXY"] {
+        let Some(path) = env::var_os(name).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        return path
+            .is_file()
+            .then_some(path.clone())
+            .ok_or(VmResourcesError::InvalidGvproxy(path));
+    }
+    if let Some(path) = find_on_path("gvproxy") {
+        return Ok(path);
+    }
+    let artifact = gvproxy_artifact()?;
+    let directory = cache.join("gvproxy").join(GVPROXY_VERSION);
+    let binary = directory.join("gvproxy");
+    if binary.is_file() && file_digest(&binary)? == artifact.digest {
+        return Ok(binary);
+    }
+    fs::create_dir_all(&directory)?;
+    let temporary = directory.join(format!("gvproxy.{}.tmp", std::process::id()));
+    let status = Command::new("/usr/bin/curl")
+        .arg("--fail")
+        .arg("--location")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg(&temporary)
+        .arg(artifact.url)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(VmResourcesError::NetworkDownload(status));
+    }
+    let actual = file_digest(&temporary)?;
+    if actual != artifact.digest {
+        let _ = fs::remove_file(&temporary);
+        return Err(VmResourcesError::NetworkDigest {
+            expected: artifact.digest,
+            actual,
+        });
+    }
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))?;
+    fs::rename(temporary, &binary)?;
+    Ok(binary)
+}
+
+struct GvproxyArtifact {
+    url: &'static str,
+    digest: &'static str,
+}
+
+fn gvproxy_artifact() -> Result<GvproxyArtifact, VmResourcesError> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("macos", "aarch64" | "x86_64") => Ok(GvproxyArtifact {
+            url: "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-darwin",
+            digest: "c6f7b4bc7f21bf810b5cf54e04d979b014c5d96472a03a9e97fe62a00940067c",
+        }),
+        ("linux", "aarch64") => Ok(GvproxyArtifact {
+            url: "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64",
+            digest: "6ecca02839254c9a0cc184bba7aac63755a22d7ed10d455b852528a99d7f7d4b",
+        }),
+        ("linux", "x86_64") => Ok(GvproxyArtifact {
+            url: "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-amd64",
+            digest: "3011c5629c9138d2050fb23c510e09ae53e30ec52e6a9ab85632bc1550e8ef63",
+        }),
+        (os, architecture) => Err(VmResourcesError::UnsupportedPlatform { os, architecture }),
+    }
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+fn file_digest(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
 
 /// Builds the task's declared OCI environment into a reusable ext4 root disk.
 ///

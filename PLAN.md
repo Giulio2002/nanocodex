@@ -55,10 +55,28 @@ runner and it does not by itself claim a host-saturating benchmark scheduler.
 Part 3 is a new first-class evaluation feature implemented by composing
 `nanocodex-agent` and `nanocodex-vm` behind the builders in
 `nanocodex-eval`, then exposing those builders through the complete
-`nanocodex eval ...` CLI. Nanoeval code owns task loading, scheduling,
+`nanocodex eval ...` CLI. `nanocodex-eval` owns task loading, scheduling,
 execution, verification, durable records, aggregation, and comparison.
 Harbor-compatible JSONL/ATIF and archive comparison are presentation and
 interoperability formats only; no Harbor runner participates in execution.
+
+The binary is a real downstream consumer of that API. `nanocodex-eval`
+exposes owned, typed builders for deliberate run policy and keeps image
+materialization, network discovery, task-environment maps, verifier caches,
+matched backends, stock-Codex guest execution, live capture, and comparison
+state private. Common golden-path types are reexported at the crate root;
+detailed VM and differential components retain canonical `vm` and
+`differential` module paths. Clap, central auth/model flag resolution,
+observability installation, process build metadata, terminal rendering, and
+exit-code policy stay in the binary.
+
+Local retained state has one current schema. The evaluator does not expose
+deprecated aliases, decode old nanoeval markers/configs/results, wildcard-match
+missing manifest identity, or upgrade a personal run directory in place.
+Resume requires an exact current manifest; rerunning a completed job requires
+the current invocation record. An outdated directory is ignored for resume or
+fails with an instruction to start a new job. Compatibility decoding is
+confined to the separate reader for Harbor's externally published archive.
 
 Every benchmark attempt uses a VM-backed task environment. Host execution is
 not a benchmark mode and is not exposed by the eval CLI; it may exist only as
@@ -208,7 +226,12 @@ Part 3 is complete when:
 Current status (2026-07-28): PR #58 is merged. Draft PR #61 now integrates the
 owned evaluator, Harbor-compatible presentation, complete `nanocodex eval`
 command tree, stock-Codex capture proxy, paired runner, semantic differ, task
-inventory, and running log on current `master`. After integrating
+inventory, and running log on current `master`. The paired lifecycle and VM
+resource preparation now live behind `nanocodex-eval` builders; the
+`nanocodex eval diff` module is only argument translation and rendering rather
+than a second evaluator implementation. Local retained schemas are
+current-only, with no old-run aliases, inference, or upgrade path. After
+integrating
 `origin/master` through `a2242a26`, a fresh local smoke from implementation
 merge `47b236d11c6addee64f2885c5909560b47069f4a` passed both ordinary
 Nanocodex evaluation and concurrent matched-profile Codex differential

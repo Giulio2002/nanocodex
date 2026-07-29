@@ -66,28 +66,6 @@ impl EvalOutcome {
     }
 }
 
-/// Infers whether a retained attempt is scored across durable schema versions.
-///
-/// Explicit `scored` is authoritative. Older explicit lifecycle outcomes are
-/// the next source of truth. Only artifacts that contain neither field may use
-/// a clean verifier result as legacy evidence that scoring completed.
-#[doc(hidden)]
-#[must_use]
-pub const fn infer_retained_scored(
-    scored: Option<bool>,
-    outcome: Option<EvalOutcome>,
-    verifier_present: bool,
-    exception_present: bool,
-) -> bool {
-    match scored {
-        Some(scored) => scored,
-        None => match outcome {
-            Some(outcome) => outcome.is_scored(),
-            None => verifier_present && !exception_present,
-        },
-    }
-}
-
 /// Stable classification for a lifecycle exception.
 ///
 /// An exception is independent from scoring: a healthy verifier may still
@@ -114,10 +92,6 @@ pub enum EvalExceptionKind {
     /// The evaluation runtime violated an internal invariant.
     Internal,
 }
-
-/// Deprecated name for [`EvalExceptionKind`].
-#[deprecated(since = "0.2.0", note = "use EvalExceptionKind")]
-pub type EvalFailureKind = EvalExceptionKind;
 
 /// One typed lifecycle exception retained independently from verifier score.
 #[derive(Clone, Debug, Serialize)]
@@ -610,7 +584,6 @@ impl AgentResult {
 
 /// Typed metadata emitted by Nanocodex's terminal event.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(from = "AgentMetadataWire")]
 pub struct AgentMetadata {
     /// Agent lifecycle terminal status.
     pub status: AgentStatus,
@@ -627,9 +600,8 @@ pub struct AgentMetadata {
     pub orchestration: String,
     /// Whether runtime counters and durations are exact or observed lower
     /// bounds reconstructed across cancellation or failure.
-    #[serde(default, skip_serializing_if = "MeasurementCompleteness::is_complete")]
     pub runtime_completeness: MeasurementCompleteness,
-    /// Millisecond duration retained for JSONL compatibility.
+    /// Rounded millisecond duration for display-oriented consumers.
     pub duration_ms: u64,
     /// Exact measured duration in nanoseconds.
     pub duration_ns: u64,
@@ -650,7 +622,6 @@ pub struct AgentMetadata {
     /// Retried Responses attempts.
     pub response_retries: u32,
     /// Potentially billable sent attempts whose provider usage was unavailable.
-    #[serde(default, alias = "accepted_abandoned_response_attempts")]
     pub billing_uncertain_response_attempts: u32,
     /// Time spent connecting to the Responses API.
     pub connection_duration_ns: u64,
@@ -668,8 +639,6 @@ pub struct AgentMetadata {
     pub usage: UsageTotals,
     /// Provider usage consumed by cache warmup.
     pub warmup_usage: UsageTotals,
-    #[serde(default, rename = "last_response_id", skip_serializing)]
-    pub(crate) _last_response_id: Option<String>,
     /// Estimated USD cost from provider usage and the built-in pricing catalog.
     pub cost_usd: Option<f64>,
     /// Stable explanation of whether cost is available.
@@ -677,89 +646,6 @@ pub struct AgentMetadata {
     /// Exact aggregate estimate and input/cache/output composition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<EstimatedUsdCost>,
-}
-
-#[derive(Deserialize)]
-struct AgentMetadataWire {
-    status: AgentStatus,
-    model: String,
-    effort: String,
-    #[serde(default)]
-    reasoning_mode: Option<String>,
-    transport: String,
-    orchestration: String,
-    #[serde(default)]
-    runtime_completeness: Option<MeasurementCompleteness>,
-    duration_ms: u64,
-    duration_ns: u64,
-    model_calls: u32,
-    steers: u32,
-    compactions: u32,
-    tool_calls: u32,
-    connection_attempts: u32,
-    websocket_reconnects: u32,
-    response_attempts: u32,
-    response_retries: u32,
-    #[serde(default, alias = "accepted_abandoned_response_attempts")]
-    billing_uncertain_response_attempts: u32,
-    connection_duration_ns: u64,
-    retry_backoff_duration_ns: u64,
-    model_duration_ns: u64,
-    warmup_duration_ns: u64,
-    tool_work_duration_ns: u64,
-    tool_wall_duration_ns: u64,
-    usage: UsageTotals,
-    warmup_usage: UsageTotals,
-    #[serde(default, rename = "last_response_id")]
-    last_response_id: Option<String>,
-    cost_usd: Option<f64>,
-    cost_status: String,
-    #[serde(default)]
-    estimated_cost: Option<EstimatedUsdCost>,
-}
-
-impl From<AgentMetadataWire> for AgentMetadata {
-    fn from(metadata: AgentMetadataWire) -> Self {
-        let runtime_completeness = if metadata.status == AgentStatus::Completed {
-            metadata
-                .runtime_completeness
-                .unwrap_or(MeasurementCompleteness::Complete)
-        } else {
-            MeasurementCompleteness::ObservedLowerBound
-        };
-        Self {
-            status: metadata.status,
-            model: metadata.model,
-            effort: metadata.effort,
-            reasoning_mode: metadata.reasoning_mode,
-            transport: metadata.transport,
-            orchestration: metadata.orchestration,
-            runtime_completeness,
-            duration_ms: metadata.duration_ms,
-            duration_ns: metadata.duration_ns,
-            model_calls: metadata.model_calls,
-            steers: metadata.steers,
-            compactions: metadata.compactions,
-            tool_calls: metadata.tool_calls,
-            connection_attempts: metadata.connection_attempts,
-            websocket_reconnects: metadata.websocket_reconnects,
-            response_attempts: metadata.response_attempts,
-            response_retries: metadata.response_retries,
-            billing_uncertain_response_attempts: metadata.billing_uncertain_response_attempts,
-            connection_duration_ns: metadata.connection_duration_ns,
-            retry_backoff_duration_ns: metadata.retry_backoff_duration_ns,
-            model_duration_ns: metadata.model_duration_ns,
-            warmup_duration_ns: metadata.warmup_duration_ns,
-            tool_work_duration_ns: metadata.tool_work_duration_ns,
-            tool_wall_duration_ns: metadata.tool_wall_duration_ns,
-            usage: metadata.usage,
-            warmup_usage: metadata.warmup_usage,
-            _last_response_id: metadata.last_response_id,
-            cost_usd: metadata.cost_usd,
-            cost_status: metadata.cost_status,
-            estimated_cost: metadata.estimated_cost,
-        }
-    }
 }
 
 /// Completeness of a retained numeric measurement.
@@ -915,92 +801,19 @@ fn format_error_chain(error: &(dyn Error + 'static)) -> String {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{AgentMetadata, EvalOutcome, MeasurementCompleteness, infer_retained_scored};
-
     #[test]
-    fn retained_scoring_inference_preserves_schema_precedence() {
-        let cases = [
-            (
-                "explicit scored timeout with passing verifier",
-                Some(true),
-                Some(EvalOutcome::AgentTimeout),
-                true,
-                true,
-                true,
-            ),
-            (
-                "legacy timeout with passing verifier",
-                None,
-                Some(EvalOutcome::AgentTimeout),
-                true,
-                false,
-                false,
-            ),
-            (
-                "verifier plus exception without lifecycle outcome",
-                None,
-                None,
-                true,
-                true,
-                false,
-            ),
-            (
-                "clean verifier from oldest schema",
-                None,
-                None,
-                true,
-                false,
-                true,
-            ),
-            (
-                "explicit unscored reward one",
-                Some(false),
-                Some(EvalOutcome::Passed),
-                true,
-                false,
-                false,
-            ),
-        ];
+    fn terminal_metadata_requires_runtime_completeness() {
+        let encoded = terminal_metadata("completed");
+        let error = serde_json::from_value::<super::AgentMetadata>(encoded).unwrap_err();
+        assert!(error.to_string().contains("runtime_completeness"));
 
-        for (name, scored, outcome, verifier, exception, expected) in cases {
-            assert_eq!(
-                infer_retained_scored(scored, outcome, verifier, exception),
-                expected,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_runtime_completeness_is_inferred_from_terminal_status() {
-        let cases = [
-            ("completed", None, MeasurementCompleteness::Complete),
-            ("failed", None, MeasurementCompleteness::ObservedLowerBound),
-            (
-                "cancelled",
-                None,
-                MeasurementCompleteness::ObservedLowerBound,
-            ),
-            (
-                "completed",
-                Some("observed_lower_bound"),
-                MeasurementCompleteness::ObservedLowerBound,
-            ),
-            (
-                "failed",
-                Some("complete"),
-                MeasurementCompleteness::ObservedLowerBound,
-            ),
-        ];
-
-        for (status, explicit, expected) in cases {
-            let mut encoded = terminal_metadata(status);
-            if let Some(explicit) = explicit {
-                encoded["runtime_completeness"] = json!(explicit);
-            }
-            let metadata: AgentMetadata = serde_json::from_value(encoded).unwrap();
-            assert_eq!(metadata.runtime_completeness, expected, "{status}");
-        }
+        let mut encoded = terminal_metadata("failed");
+        encoded["runtime_completeness"] = json!("observed_lower_bound");
+        let metadata: super::AgentMetadata = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            metadata.runtime_completeness,
+            super::MeasurementCompleteness::ObservedLowerBound
+        );
     }
 
     fn terminal_metadata(status: &str) -> Value {
@@ -1020,6 +833,7 @@ mod tests {
             "websocket_reconnects": 0,
             "response_attempts": 1,
             "response_retries": 0,
+            "billing_uncertain_response_attempts": 0,
             "connection_duration_ns": 1,
             "retry_backoff_duration_ns": 0,
             "model_duration_ns": 1,

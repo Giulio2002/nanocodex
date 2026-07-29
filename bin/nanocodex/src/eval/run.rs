@@ -4,11 +4,8 @@ use std::{
     fs,
     future::Future,
     io::{self, Read, Write},
-    net::{Ipv4Addr, TcpListener},
     path::{Component, Path, PathBuf},
-    pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -25,25 +22,16 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::{
-    io::{AsyncReadExt as _, AsyncSeekExt as _},
-    process::Command,
-    sync::watch,
-};
+use tokio::{process::Command, sync::watch};
 use tracing::{info, warn};
 use yansi::Painted;
 
-use super::{diff::DiffProgress, vm_network::prepare_gvproxy};
-use crate::{
-    config::{EvalAgentArgs, SharedAuth},
-    observability::ObservabilityArgs,
-};
+use crate::{config::EvalAgentArgs, observability::ObservabilityArgs};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
 const INVOCATION_FILE: &str = "invocation.json";
 const LAST_RUN_FILE: &str = ".nanocodex/eval/last-run.json";
-const LEGACY_LAST_RUN_FILE: &str = ".nanoeval/last-run.json";
-const INVOCATION_VERSION: u32 = 2;
+const INVOCATION_VERSION: u32 = 3;
 const SCHEDULING_POLICY: &str = "bounded_fifo_work_conserving-v1";
 const DEFAULT_TRIALS: u16 = 5;
 const DEFAULT_HOST_UTILIZATION_PERCENT: u8 = 80;
@@ -175,7 +163,6 @@ struct ResolvedRun {
     trials: u16,
     concurrency: u16,
     max_memory_mb: Option<u64>,
-    vm: bool,
     vm_rootfs: Option<PathBuf>,
     vm_guest_runtime: Option<PathBuf>,
     vm_retention: VmRetention,
@@ -235,13 +222,10 @@ struct RunInvocation {
     trials: u16,
     concurrency: u16,
     max_memory_mb: Option<u64>,
-    vm: bool,
     vm_rootfs: Option<PathBuf>,
-    #[serde(default)]
     guest_runtime: Option<RetainedGuestRuntime>,
     vm_retention: VmRetention,
     thinking: String,
-    #[serde(default)]
     web_search: bool,
     rerun_from: Option<PathBuf>,
 }
@@ -261,7 +245,6 @@ struct RetainedGuestRuntime {
     target: String,
     binary_sha256: String,
     runtime_disk_digest: Option<String>,
-    #[serde(default)]
     artifact_path: Option<PathBuf>,
     source: String,
     source_path: PathBuf,
@@ -286,7 +269,6 @@ impl RunInvocation {
             && self.seed == other.seed
             && self.scheduling.policy == other.scheduling.policy
             && self.trials == other.trials
-            && self.vm == other.vm
             && self.vm_rootfs == other.vm_rootfs
             && same_guest_runtime(self.guest_runtime.as_ref(), other.guest_runtime.as_ref())
             && self.vm_retention == other.vm_retention
@@ -333,8 +315,8 @@ struct RetainedJobIdentity {
 #[derive(Debug, Deserialize)]
 struct RetainedTrialResult {
     task_name: String,
-    outcome: Option<EvalOutcome>,
-    scored: Option<bool>,
+    outcome: EvalOutcome,
+    scored: bool,
     verifier_result: Option<RetainedVerifierResult>,
     exception_info: Option<RetainedTrialException>,
 }
@@ -347,22 +329,6 @@ struct RetainedVerifierResult {
 #[derive(Debug, Deserialize)]
 struct RetainedTrialException {
     exception_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyJobConfig {
-    n_concurrent_trials: usize,
-    agents: Vec<LegacyAgentConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyAgentConfig {
-    kwargs: LegacyAgentKwargs,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacyAgentKwargs {
-    effort: String,
 }
 
 impl HostResources {
@@ -408,29 +374,19 @@ struct RetainedTrialStatus {
 }
 
 impl Run {
-    fn resolve_scheduling(
-        &self,
-        retained: Option<&RunInvocation>,
-        legacy: Option<&LegacyJobConfig>,
-    ) -> ResolvedScheduling {
+    fn resolve_scheduling(&self, retained: Option<&RunInvocation>) -> ResolvedScheduling {
         let host = HostResources::detect();
         let defaults = host.scheduling_defaults(self.host_utilization);
         let retained_concurrency = retained.map(|invocation| invocation.concurrency);
-        let legacy_concurrency = legacy.and_then(|job| u16::try_from(job.n_concurrent_trials).ok());
-        let automatic_concurrency = self.concurrency.is_none()
-            && retained_concurrency.is_none()
-            && legacy_concurrency.is_none();
+        let automatic_concurrency = self.concurrency.is_none() && retained_concurrency.is_none();
         let concurrency = self
             .concurrency
             .or(retained_concurrency)
-            .or(legacy_concurrency)
             .unwrap_or(defaults.concurrency);
         let (max_memory_mb, automatic_memory) = if let Some(memory) = self.max_memory_mb {
             (Some(memory), false)
         } else if let Some(invocation) = retained {
             (invocation.max_memory_mb, false)
-        } else if legacy.is_some() {
-            (None, false)
         } else {
             (defaults.max_memory_mb, defaults.max_memory_mb.is_some())
         };
@@ -455,13 +411,9 @@ impl Run {
             .then(|| resolve_rerun_source(self))
             .transpose()?;
         let retained_invocation = match &rerun {
-            Some(rerun) => load_invocation(&rerun.job)?,
+            Some(rerun) => Some(load_required_invocation(&rerun.job)?),
             None => None,
         };
-        let legacy = rerun
-            .as_ref()
-            .map(|rerun| load_legacy_job_config(&rerun.job))
-            .transpose()?;
         let task_paths = match &rerun {
             Some(rerun) => rerun.tasks.clone(),
             None => load_task_paths(self.tasks.clone(), self.suites.clone())?,
@@ -486,12 +438,10 @@ impl Run {
                 })
             })
             .transpose()?;
-        let legacy_thinking = legacy.as_ref().map(LegacyJobConfig::thinking).transpose()?;
         let thinking = self
             .agent
             .thinking()
             .or(retained_thinking)
-            .or(legacy_thinking)
             .unwrap_or_default();
         let web_search = self
             .agent
@@ -511,19 +461,13 @@ impl Run {
             .vm_guest_runtime
             .clone()
             .or_else(|| std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from));
-        // Evaluation always executes workspace tools and verification in a
-        // microVM. `vm` remains in the retained invocation schema so an
-        // incomplete pre-invariant host job cannot be resumed into a mixed
-        // execution environment.
-        let vm = true;
-        let scheduling = self.resolve_scheduling(retained_invocation.as_ref(), legacy.as_ref());
+        let scheduling = self.resolve_scheduling(retained_invocation.as_ref());
         Ok(ResolvedRun {
             task_paths,
             output,
             trials: self.trials,
             concurrency: scheduling.concurrency,
             max_memory_mb: scheduling.max_memory_mb,
-            vm,
             vm_rootfs,
             vm_guest_runtime,
             vm_retention: self
@@ -591,18 +535,18 @@ impl Run {
             &resolved.invocation(guest_runtime.clone())?,
         )?;
         evaluation_setup += invocation_started.elapsed();
-        let gvproxy = prepare_task_network(true, &tasks).await?;
         let vm_environments_started = Instant::now();
-        let environments =
-            prepare_run_environments(&tasks, &resolved, self.vm_refresh, &vmm, &runtime_image)
-                .await?;
-        let mut configuration =
-            VmBackendConfiguration::builder(vmm, runtime_image).environments(environments);
-        if let Some(gvproxy) = gvproxy {
-            configuration = configuration.gvproxy(gvproxy);
+        let mut resources = VmResources::builder(vmm, runtime_image)
+            .tasks(tasks.clone())
+            .cache_policy(if self.vm_refresh {
+                CachePolicy::Refresh
+            } else {
+                CachePolicy::Reuse
+            });
+        if let Some(rootfs) = &resolved.vm_rootfs {
+            resources = resources.rootfs(rootfs);
         }
-        vm_backend.configure(configuration.build())?;
-        vm_backend.prepare_verifier_caches(&tasks).await?;
+        resources.prepare().await?.configure(&vm_backend).await?;
         let vm_environments_duration = vm_environments_started.elapsed();
         report_resume(&eval, skipped_attempts, attempt_count);
         let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
@@ -811,10 +755,10 @@ impl Run {
 }
 
 fn persist_aggregate(job: &HarborJob, cold_image_and_cache: Duration) -> Result<()> {
-    let mut aggregate = job.aggregate_dataset()?;
-    if let Some(invocation) = load_invocation(job.directory())? {
-        aggregate = aggregate.with_run_identity(aggregate_run_identity(&invocation));
-    }
+    let invocation = load_required_invocation(job.directory())?;
+    let aggregate = job
+        .aggregate_dataset()?
+        .with_run_identity(aggregate_run_identity(&invocation));
     write_json_atomic(
         &job.directory().join("aggregate.json"),
         &aggregate.with_run_timing(AggregateRunTiming {
@@ -824,7 +768,7 @@ fn persist_aggregate(job: &HarborJob, cold_image_and_cache: Duration) -> Result<
 }
 
 fn aggregate_run_identity(invocation: &RunInvocation) -> AggregateRunIdentity {
-    let vm = (invocation.vm || invocation.vm_rootfs.is_some()).then(|| AttemptVmIdentity {
+    let vm = Some(AttemptVmIdentity {
         rootfs: invocation.vm_rootfs.clone(),
         guest_runtime_target: invocation
             .guest_runtime
@@ -932,7 +876,6 @@ impl ResolvedRun {
             trials: self.trials,
             concurrency: self.concurrency,
             max_memory_mb: self.max_memory_mb,
-            vm: self.vm,
             vm_rootfs: self.vm_rootfs.clone(),
             guest_runtime,
             vm_retention: self.vm_retention,
@@ -940,19 +883,6 @@ impl ResolvedRun {
             web_search: self.web_search,
             rerun_from: self.rerun_from.clone(),
         })
-    }
-}
-
-impl LegacyJobConfig {
-    fn thinking(&self) -> Result<Thinking> {
-        let effort = self
-            .agents
-            .first()
-            .ok_or_else(|| eyre!("retained job config contains no agent"))?
-            .kwargs
-            .effort
-            .as_str();
-        Thinking::from_str(effort).map_err(|error| eyre!(error))
     }
 }
 
@@ -1071,10 +1001,7 @@ fn short_task_name(name: &str) -> &str {
 }
 
 fn latest_completed_job(output: Option<&Path>) -> Result<PathBuf> {
-    if let Some(job) = completed_job_from_last_run(
-        output,
-        [Path::new(LAST_RUN_FILE), Path::new(LEGACY_LAST_RUN_FILE)],
-    ) {
+    if let Some(job) = completed_job_from_last_run(output, Path::new(LAST_RUN_FILE)) {
         return Ok(job);
     }
     let current = std::env::current_dir()?;
@@ -1104,17 +1031,12 @@ fn latest_completed_job(output: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
-fn completed_job_from_last_run<'a>(
-    output: Option<&Path>,
-    last_run_files: impl IntoIterator<Item = &'a Path>,
-) -> Option<PathBuf> {
-    for last_run in last_run_files {
-        if let Ok(retained) = read_json::<LastRun>(last_run)
-            && let Ok(job) = resolve_job_path(&retained.job, output)
-            && job.join("result.json").is_file()
-        {
-            return Some(job);
-        }
+fn completed_job_from_last_run(output: Option<&Path>, last_run: &Path) -> Option<PathBuf> {
+    if let Ok(retained) = read_json::<LastRun>(last_run)
+        && let Ok(job) = resolve_job_path(&retained.job, output)
+        && job.join("result.json").is_file()
+    {
+        return Some(job);
     }
     None
 }
@@ -1228,8 +1150,7 @@ fn retained_retry_lineage(job: &Path) -> Result<Vec<PathBuf>> {
             ));
         }
         lineage.push(current.clone());
-        let Some(parent) = load_invocation(&current)?.and_then(|invocation| invocation.rerun_from)
-        else {
+        let Some(parent) = load_required_invocation(&current)?.rerun_from else {
             break;
         };
         current = fs::canonicalize(&parent).map_err(|error| {
@@ -1267,12 +1188,7 @@ fn retained_task_statuses(job: &Path) -> Result<BTreeMap<String, RetainedTrialSt
 
 impl RetainedTrialResult {
     fn status(&self) -> RetainedTrialStatus {
-        let scored = infer_retained_scored(
-            self.scored,
-            self.outcome,
-            self.verifier_result.is_some(),
-            self.exception_info.is_some(),
-        );
+        let scored = self.scored;
         let passed = scored
             && self
                 .verifier_result
@@ -1288,15 +1204,13 @@ impl RetainedTrialResult {
                 exception != "CleanupError",
             ),
             None => (
-                self.outcome == Some(EvalOutcome::SafetyRefusal),
-                self.outcome.is_some_and(|outcome| {
-                    matches!(
-                        outcome,
-                        EvalOutcome::SafetyRefusal
-                            | EvalOutcome::AgentTimeout
-                            | EvalOutcome::InfrastructureError
-                    )
-                }),
+                self.outcome == EvalOutcome::SafetyRefusal,
+                matches!(
+                    self.outcome,
+                    EvalOutcome::SafetyRefusal
+                        | EvalOutcome::AgentTimeout
+                        | EvalOutcome::InfrastructureError
+                ),
             ),
         };
         RetainedTrialStatus {
@@ -1338,8 +1252,13 @@ fn load_invocation(job: &Path) -> Result<Option<RunInvocation>> {
     }
 }
 
-fn load_legacy_job_config(job: &Path) -> Result<LegacyJobConfig> {
-    read_json(&job.join("config.json"))
+fn load_required_invocation(job: &Path) -> Result<RunInvocation> {
+    load_invocation(job)?.ok_or_else(|| {
+        eyre!(
+            "unsupported retained evaluation in {}; start a new job",
+            job.display()
+        )
+    })
 }
 
 fn persist_invocation(job: &Path, invocation: &RunInvocation) -> Result<()> {
@@ -1728,7 +1647,7 @@ fn retained_task_durations(output: &Path) -> Result<BTreeMap<String, Duration>> 
             if result.exception_info.as_ref().is_some_and(|exception| {
                 matches!(
                     exception.exception_type.as_str(),
-                    "EnvironmentError" | "VerifierError" | "NanocodexEvalError" | "NanoevalError"
+                    "EnvironmentError" | "VerifierError" | "NanocodexEvalError"
                 )
             }) {
                 continue;
@@ -1786,84 +1705,6 @@ pub(crate) fn load_task_paths(
         paths.extend(suite_tasks);
     }
     Ok(paths)
-}
-
-async fn prepare_network_for_vm(enabled: bool) -> Result<Option<PathBuf>> {
-    if enabled {
-        Ok(Some(prepare_gvproxy(Path::new(DEFAULT_VM_CACHE)).await?))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn prepare_task_network(vm_enabled: bool, tasks: &[Task]) -> Result<Option<PathBuf>> {
-    let public = tasks
-        .iter()
-        .any(|task| task.network() == NetworkPolicy::Public);
-    prepare_network_for_vm(vm_enabled && public).await
-}
-
-async fn selected_vm_environments(
-    tasks: &[Task],
-    rootfs: Option<PathBuf>,
-    refresh: bool,
-    vmm: &Path,
-    runtime_image: &Path,
-) -> Result<BTreeMap<PathBuf, VmEnvironment>> {
-    if let Some(task) = tasks.iter().find(|task| task.requires_compose()) {
-        return Err(eyre!(
-            "task {} requires a custom Docker Compose topology; the single-guest eval backend \
-             does not implement Compose tasks",
-            task.name()
-        ));
-    }
-    if let Some(rootfs) = rootfs {
-        let workspace = if rootfs.is_file() {
-            "/app"
-        } else {
-            "/workspace"
-        };
-        let environment = VmEnvironment::new(rootfs, workspace, "bash");
-        return Ok(tasks
-            .iter()
-            .map(|task| (task.root().to_path_buf(), environment.clone()))
-            .collect());
-    }
-    let policy = if refresh {
-        CachePolicy::Refresh
-    } else {
-        CachePolicy::Reuse
-    };
-    let image_builder = eval_vm_image_builder(vmm, runtime_image);
-    prepare_vm_environments(tasks, Path::new(DEFAULT_VM_CACHE), policy, &image_builder).await
-}
-
-pub(crate) fn eval_vm_image_builder(vmm: &Path, runtime_image: &Path) -> VmImageBuilder {
-    let builder = VmImageBuilder::new(vmm, runtime_image).vmm_args(["vm-run-config", "--config"]);
-    let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
-    let builder = if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
-        builder.firmware_directory(firmware)
-    } else {
-        builder
-    };
-    EVAL_IMAGE_BUILD_POLICY.apply(builder)
-}
-
-async fn prepare_run_environments(
-    tasks: &[Task],
-    resolved: &ResolvedRun,
-    refresh: bool,
-    vmm: &Path,
-    runtime_image: &Path,
-) -> Result<BTreeMap<PathBuf, VmEnvironment>> {
-    selected_vm_environments(
-        tasks,
-        resolved.vm_rootfs.clone(),
-        refresh,
-        vmm,
-        runtime_image,
-    )
-    .await
 }
 
 struct RunMeasurements {
@@ -2072,64 +1913,6 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-async fn prepare_vm_environments(
-    tasks: &[Task],
-    cache: &Path,
-    policy: CachePolicy,
-    builder: &VmImageBuilder,
-) -> Result<BTreeMap<PathBuf, VmEnvironment>> {
-    let mut environments = BTreeMap::new();
-    for task in tasks {
-        if environments.contains_key(task.root()) {
-            continue;
-        }
-        task.validate_package()?;
-        let prepared = prepare_task_image(builder, task, cache, policy).await?;
-        task.validate_package()?;
-        let verifier = if task.verifier().environment_mode() == VerifierEnvironmentMode::Separate {
-            let verifier = prepare_verifier_image(builder, task, cache, policy).await?;
-            task.validate_package()?;
-            info!(
-                target: "nanocodex_eval",
-                task_name = task.name(),
-                oci_manifest_digest = verifier.manifest_digest(),
-                oci_manifest_source = verifier.manifest_source().as_str(),
-                vm_rootfs_cache_status = verifier.disk_status().as_str(),
-                vm_rootfs_path = %verifier.path().display(),
-                "separate verifier VM root disk ready"
-            );
-            Some(
-                VmVerifierEnvironment::new(verifier.path(), verifier.workdir(), verifier.shell())
-                    .environment(verifier.environment().clone()),
-            )
-        } else {
-            None
-        };
-        info!(
-            target: "nanocodex_eval",
-            task_name = task.name(),
-            oci_manifest_digest = prepared.manifest_digest(),
-            oci_manifest_source = prepared.manifest_source().as_str(),
-            vm_rootfs_cache_status = prepared.disk_status().as_str(),
-            vm_rootfs_path = %prepared.path().display(),
-            "VM root disk ready"
-        );
-        environments.insert(
-            task.root().to_path_buf(),
-            match verifier {
-                Some(verifier) => {
-                    VmEnvironment::new(prepared.path(), prepared.workdir(), prepared.shell())
-                        .environment(prepared.environment().clone())
-                        .verifier(verifier)
-                }
-                None => VmEnvironment::new(prepared.path(), prepared.workdir(), prepared.shell())
-                    .environment(prepared.environment().clone()),
-            },
-        );
-    }
-    Ok(environments)
-}
-
 #[derive(Debug)]
 struct PreparedGuestRuntime {
     disk: PathBuf,
@@ -2178,35 +1961,7 @@ const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
 const GUEST_RUNTIME_DISK_BINARY_PATH: &str = "/nanocodex-vm-guest";
 const GUEST_RUNTIME_ARTIFACT_ROOT: &str = "guest-runtime/artifacts";
 const GUEST_RUNTIME_CACHE_ROOT: &str = "guest-runtime/cache";
-const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
-const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
-const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
-const DIFF_CAPTURE_PROXY_VM_HOST: &str = "host.containers.internal";
-const DIFF_CAPTURE_PROXY_API_UPSTREAM: &str = "https://api.openai.com/v1";
-const DIFF_CAPTURE_PROXY_CHATGPT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
-const DIFF_CAPTURE_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const DIFF_API_EXCHANGES_FILENAME: &str = "api-exchanges.jsonl";
-const DIFF_CODEX_HOME: &str = "/run/nanoeval-codex-home";
-const DIFF_CODEX_AUTH_FILE: &str = "/run/nanoeval-codex-home/auth.json";
-const DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME: &str = "cloud-config-bundle-cache.json";
-const DIFF_CODEX_CLOUD_CONFIG_CACHE_FILE: &str =
-    "/run/nanoeval-codex-home/cloud-config-bundle-cache.json";
-const DIFF_CODEX_CA_BUNDLE_FILENAME: &str = "ca-certificates.pem";
-const DIFF_CODEX_CA_BUNDLE_FILE: &str = "/run/nanoeval-codex/ca-certificates.pem";
-const DIFF_CODEX_CA_CERTIFICATE_ENVIRONMENT: &str = "CODEX_CA_CERTIFICATE";
-const DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT: &str = "SSL_CERT_FILE";
-const DIFF_CODEX_NIX_SSL_CERT_FILE_ENVIRONMENT: &str = "NIX_SSL_CERT_FILE";
-const DIFF_CODEX_LIVE_STDOUT_FILE: &str = "/run/nanoeval-codex-home/codex-live-events.jsonl";
-const DIFF_CODEX_LIVE_STDERR_FILE: &str = "/run/nanoeval-codex-home/codex-live-stderr.log";
-const DIFF_CODEX_PROGRESS_POLL: Duration = Duration::from_millis(500);
-const DIFF_CODEX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const DIFF_CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
-const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
-#[cfg(target_os = "macos")]
-const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.5.dylib";
-#[cfg(not(target_os = "macos"))]
-const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
 #[cfg(target_arch = "aarch64")]
 const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
@@ -2217,745 +1972,17 @@ const VM_GUEST_ELF_MACHINE: u16 = 183;
 const VM_GUEST_ELF_MACHINE: u16 = 62;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hosts");
-const EVAL_IMAGE_BUILD_POLICY: EvalImageBuildPolicy = EvalImageBuildPolicy {
-    prefer_ipv4: true,
-    run_timeout: Duration::from_mins(60),
-};
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct EvalImageBuildPolicy {
-    prefer_ipv4: bool,
-    run_timeout: Duration,
-}
-
-impl EvalImageBuildPolicy {
-    const fn apply(self, builder: VmImageBuilder) -> VmImageBuilder {
-        let builder = builder.run_timeout(self.run_timeout);
-        if self.prefer_ipv4 {
-            builder.prefer_ipv4()
-        } else {
-            builder
-        }
-    }
-}
-
-pub(super) struct DiffVmResources {
-    environment: VmEnvironment,
-    nanocodex: VmBackend,
-    codex: VmBackend,
-    codex_ca_bundle: Option<DiffCodexCaBundle>,
-}
-
-pub(super) async fn prepare_diff_vm_resources(
-    task: &Task,
-    comparison_directory: &Path,
-    guest_runtime: Option<&Path>,
-    refresh: bool,
-    web_search: bool,
-    codex_binary: &Path,
-) -> Result<DiffVmResources> {
-    let codex_share_root = comparison_directory.join("codex-release");
-    fs::create_dir(&codex_share_root)?;
-    let staged_codex = codex_share_root.join("codex");
-    reflink_or_sparse_copy(codex_binary, &staged_codex)?;
-    #[cfg(unix)]
-    fs::set_permissions(&staged_codex, fs::Permissions::from_mode(0o755))?;
-    let mut header = [0_u8; 20];
-    fs::File::open(&staged_codex)?.read_exact(&mut header)?;
-    validate_vm_guest_elf(&header, &staged_codex)?;
-    let codex_ca_bundle = match resolve_diff_codex_ca_source()? {
-        Some(source) => Some(stage_diff_codex_ca_bundle(&source, &codex_share_root)?),
-        None => None,
-    };
-
-    let (vmm, runtime_image, _, _) = prepare_run_vm(
-        None,
-        guest_runtime,
-        comparison_directory,
-        false,
-        None,
-        false,
-    )
-    .await?;
-    let tasks = std::slice::from_ref(task);
-    let gvproxy = prepare_task_network(true, tasks).await?;
-    let mut environments =
-        selected_vm_environments(tasks, None, refresh, &vmm, &runtime_image).await?;
-    let environment = environments.remove(task.root()).ok_or_else(|| {
-        eyre!(
-            "VM diff did not prepare the requested task root {}",
-            task.root().display()
-        )
-    })?;
-    let nanocodex = VmBackend::builder()
-        .retain_passed_rootfs(true)
-        .web_search(web_search)
-        .build();
-    let mut nanocodex_configuration = VmBackendConfiguration::builder(&vmm, &runtime_image)
-        .environment(task.root(), environment.clone());
-    if let Some(gvproxy) = &gvproxy {
-        nanocodex_configuration = nanocodex_configuration.gvproxy(gvproxy);
-    }
-    nanocodex.configure(nanocodex_configuration.build())?;
-    nanocodex.prepare_verifier_caches(tasks).await?;
-
-    let codex = VmBackend::builder()
-        .retain_passed_rootfs(true)
-        .web_search(web_search)
-        .shared_directory(SharedDirectory::read_only(
-            DIFF_CODEX_SHARE_TAG,
-            codex_share_root,
-        ))
-        .build();
-    let mut codex_configuration = VmBackendConfiguration::builder(vmm, runtime_image)
-        .environment(task.root(), environment.clone());
-    if let Some(gvproxy) = gvproxy {
-        codex_configuration = codex_configuration.gvproxy(gvproxy);
-    }
-    codex.configure(codex_configuration.build())?;
-    Ok(DiffVmResources {
-        environment,
-        nanocodex,
-        codex,
-        codex_ca_bundle,
-    })
-}
-
-impl DiffVmResources {
-    pub(super) fn nanocodex_backend(&self) -> VmBackend {
-        self.nanocodex.clone()
-    }
-
-    pub(super) fn codex_backend(&self) -> VmBackend {
-        self.codex.clone()
-    }
-
-    pub(super) fn codex_attempt(
-        &self,
-        runtime: VmAttempt,
-        attempt: EvalAttempt<'_>,
-        codex: CodexExec,
-        auth: SharedAuth,
-        version: Arc<OnceLock<String>>,
-        progress: DiffProgress,
-    ) -> Result<AttemptAgent, nanocodex_eval::vm::VmAttemptError> {
-        let model_catalog_override = codex
-            .code_mode_only_model()
-            .map(ResponsesModelCatalogOverride::code_mode_only);
-        let session = runtime.session_handle()?;
-        let runner = DiffVmCodexRunner::new(
-            session,
-            attempt,
-            &self.environment,
-            auth,
-            self.codex_ca_bundle,
-            version,
-            progress,
-        )?
-        .model_catalog_override(model_catalog_override);
-        let api_base_url = runner.api_base_url().to_owned();
-        let runner = Arc::new(runner);
-        let readiness = Arc::clone(&runner);
-        Ok(runtime
-            .codex(codex.api_base_url(api_base_url).command_runner(runner))
-            .ready(async move { readiness.prepare().await }))
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DiffCodexCaBundle {
-    guest_environment: &'static str,
-}
-
-struct DiffCodexCaSource {
-    path: PathBuf,
-    source_environment: &'static str,
-    guest_environment: &'static str,
-}
-
-fn resolve_diff_codex_ca_source() -> Result<Option<DiffCodexCaSource>, io::Error> {
-    for (source_environment, guest_environment) in [
-        (
-            DIFF_CODEX_CA_CERTIFICATE_ENVIRONMENT,
-            DIFF_CODEX_CA_CERTIFICATE_ENVIRONMENT,
-        ),
-        (
-            DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-            DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-        ),
-        (
-            DIFF_CODEX_NIX_SSL_CERT_FILE_ENVIRONMENT,
-            DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-        ),
-    ] {
-        let Some(path) = std::env::var_os(source_environment).filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        return Ok(Some(DiffCodexCaSource {
-            path: fs::canonicalize(PathBuf::from(path))?,
-            source_environment,
-            guest_environment,
-        }));
-    }
-
-    for path in [
-        Path::new("/etc/ssl/certs/ca-certificates.crt"),
-        Path::new("/etc/ssl/cert.pem"),
-    ] {
-        if path.is_file() {
-            return Ok(Some(DiffCodexCaSource {
-                path: fs::canonicalize(path)?,
-                source_environment: "host_system",
-                guest_environment: DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-            }));
-        }
-    }
-    Ok(None)
-}
-
-fn stage_diff_codex_ca_bundle(
-    source: &DiffCodexCaSource,
-    codex_share_root: &Path,
-) -> Result<DiffCodexCaBundle, io::Error> {
-    let staged = codex_share_root.join(DIFF_CODEX_CA_BUNDLE_FILENAME);
-    reflink_or_sparse_copy(&source.path, &staged)?;
-    if staged.metadata()?.len() == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Codex CA bundle selected by {} is empty: {}",
-                source.source_environment,
-                source.path.display()
-            ),
-        ));
-    }
-    #[cfg(unix)]
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o444))?;
-    info!(
-        target: "nanocodex_eval",
-        source_environment = source.source_environment,
-        source_path = %source.path.display(),
-        staged_path = %staged.display(),
-        "staged the host CA bundle for the pinned guest Codex release"
-    );
-    Ok(DiffCodexCaBundle {
-        guest_environment: source.guest_environment,
-    })
-}
-
-enum DiffVmCodexAuth {
-    ApiKey(Arc<str>),
-    AuthFile {
-        contents: Vec<u8>,
-        cloud_config_cache: Option<Vec<u8>>,
-    },
-}
-
-struct DiffVmCodexRunner {
-    session: VmToolSessionHandle,
-    workspace: String,
-    environment: Vec<(String, String)>,
-    auth_file: Option<Vec<u8>>,
-    cloud_config_cache: Option<Vec<u8>>,
-    capture_upstream: &'static str,
-    model_catalog_override: Option<ResponsesModelCatalogOverride>,
-    capture_listener: Mutex<Option<TcpListener>>,
-    capture_base_url: String,
-    api_exchanges: PathBuf,
-    version: Arc<OnceLock<String>>,
-    progress: DiffProgress,
-}
-
-impl DiffVmCodexRunner {
-    fn new(
-        session: VmToolSessionHandle,
-        attempt: EvalAttempt<'_>,
-        environment: &VmEnvironment,
-        auth: SharedAuth,
-        ca_bundle: Option<DiffCodexCaBundle>,
-        version: Arc<OnceLock<String>>,
-        progress: DiffProgress,
-    ) -> Result<Self, VmAttemptError> {
-        let artifact_directory = attempt.directory().join("agent");
-        fs::create_dir_all(&artifact_directory)?;
-        let auth = match auth {
-            SharedAuth::ApiKey(api_key) => DiffVmCodexAuth::ApiKey(api_key),
-            SharedAuth::AuthFile(path) => {
-                let contents = fs::read(&path)?;
-                let cloud_config_cache = read_optional_codex_cloud_config_cache(&path)?;
-                DiffVmCodexAuth::AuthFile {
-                    contents,
-                    cloud_config_cache,
-                }
-            }
-        };
-        let mut command_environment = environment.guest_environment(attempt.task());
-        command_environment.insert("CODEX_HOME".to_owned(), DIFF_CODEX_HOME.to_owned());
-        if let Some(ca_bundle) = ca_bundle {
-            command_environment.insert(
-                ca_bundle.guest_environment.to_owned(),
-                DIFF_CODEX_CA_BUNDLE_FILE.to_owned(),
-            );
-        }
-        let (auth_file, cloud_config_cache, capture_upstream) = match auth {
-            DiffVmCodexAuth::ApiKey(api_key) => {
-                command_environment.insert("OPENAI_API_KEY".to_owned(), api_key.to_string());
-                (None, None, DIFF_CAPTURE_PROXY_API_UPSTREAM)
-            }
-            DiffVmCodexAuth::AuthFile {
-                contents,
-                cloud_config_cache,
-            } => {
-                command_environment.remove("OPENAI_API_KEY");
-                (
-                    Some(contents),
-                    cloud_config_cache,
-                    DIFF_CAPTURE_PROXY_CHATGPT_UPSTREAM,
-                )
-            }
-        };
-        let capture_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let capture_port = capture_listener.local_addr()?.port();
-        let capture_base_url = format!("http://{DIFF_CAPTURE_PROXY_VM_HOST}:{capture_port}");
-        Ok(Self {
-            session,
-            workspace: environment.workspace().to_owned(),
-            environment: command_environment.into_iter().collect(),
-            auth_file,
-            cloud_config_cache,
-            capture_upstream,
-            model_catalog_override: None,
-            capture_listener: Mutex::new(Some(capture_listener)),
-            capture_base_url,
-            api_exchanges: artifact_directory.join(DIFF_API_EXCHANGES_FILENAME),
-            version,
-            progress,
-        })
-    }
-
-    fn model_catalog_override(
-        mut self,
-        model_catalog_override: Option<ResponsesModelCatalogOverride>,
-    ) -> Self {
-        self.model_catalog_override = model_catalog_override;
-        self
-    }
-
-    fn api_base_url(&self) -> &str {
-        &self.capture_base_url
-    }
-
-    async fn prepare(&self) -> Result<(), VmAttemptError> {
-        self.session.ready().await?;
-        self.session
-            .create_directory(DIFF_CODEX_SHARE_MOUNT, 0o755, None)
-            .await?;
-        let mount = self
-            .session
-            .command(
-                VmCommand::new("/bin/mount")
-                    .arg("-t")
-                    .arg("virtiofs")
-                    .arg("-o")
-                    .arg("ro")
-                    .arg(DIFF_CODEX_SHARE_TAG)
-                    .arg(DIFF_CODEX_SHARE_MOUNT)
-                    .environment(self.environment.clone())
-                    .timeout(DIFF_CODEX_VERSION_TIMEOUT),
-            )
-            .await?;
-        if mount.exit_code != 0 {
-            return Err(io::Error::other(format!(
-                "failed to mount the pinned Codex release in the guest (exit {}): {}",
-                mount.exit_code,
-                String::from_utf8_lossy(&mount.stderr).trim()
-            ))
-            .into());
-        }
-        self.session
-            .create_directory(DIFF_CODEX_HOME, 0o700, None)
-            .await?;
-        if let Some(auth_file) = &self.auth_file {
-            self.session
-                .write_file(DIFF_CODEX_AUTH_FILE, auth_file.clone(), 0o600)
-                .await?;
-        }
-        if let Some(cloud_config_cache) = &self.cloud_config_cache {
-            self.session
-                .write_file(
-                    DIFF_CODEX_CLOUD_CONFIG_CACHE_FILE,
-                    cloud_config_cache.clone(),
-                    0o600,
-                )
-                .await?;
-        }
-        let version = self
-            .session
-            .command(
-                VmCommand::new(DIFF_CODEX_GUEST_BINARY)
-                    .arg("--version")
-                    .current_directory(&self.workspace)
-                    .environment(self.environment.clone())
-                    .timeout(DIFF_CODEX_VERSION_TIMEOUT),
-            )
-            .await?;
-        if version.exit_code != 0 {
-            return Err(io::Error::other(format!(
-                "pinned guest Codex --version exited {}: {}",
-                version.exit_code,
-                String::from_utf8_lossy(&version.stderr).trim()
-            ))
-            .into());
-        }
-        let version = String::from_utf8(version.stdout)
-            .map_err(io::Error::other)?
-            .trim()
-            .to_owned();
-        if version.is_empty() {
-            return Err(
-                io::Error::other("pinned guest Codex --version returned no version").into(),
-            );
-        }
-        if let Some(existing) = self.version.get() {
-            if existing != &version {
-                return Err(io::Error::other(format!(
-                    "pinned guest Codex version changed from {existing} to {version}"
-                ))
-                .into());
-            }
-        } else {
-            self.version
-                .set(version)
-                .map_err(|_| io::Error::other("failed to retain pinned guest Codex version"))?;
-        }
-        Ok(())
-    }
-
-    async fn start_capture_proxy(&self) -> Result<ResponsesCaptureProxy, CodexCommandRunnerError> {
-        let listener = {
-            let mut listener = self.capture_listener.lock().map_err(|_| {
-                CodexCommandRunnerError::new("Responses capture listener lock was poisoned")
-            })?;
-            listener.take().ok_or_else(|| {
-                CodexCommandRunnerError::new(
-                    "Responses capture proxy was already started for this attempt",
-                )
-            })?
-        };
-        let proxy = ResponsesCaptureProxy::start(
-            listener,
-            ResponsesCaptureProxyConfig {
-                upstream: self.capture_upstream.to_owned(),
-                output: self.api_exchanges.clone(),
-                model_catalog_override: self.model_catalog_override.clone(),
-            },
-        )
-        .await
-        .map_err(|error| CodexCommandRunnerError::new(error.to_string()))?;
-        self.progress.emit(
-            "codex",
-            "api.capture.started",
-            format!("{} → {}", self.capture_base_url, self.capture_upstream),
-        );
-        Ok(proxy)
-    }
-
-    async fn stop_capture_proxy(
-        &self,
-        proxy: ResponsesCaptureProxy,
-    ) -> Result<(), CodexCommandRunnerError> {
-        match tokio::time::timeout(DIFF_CAPTURE_PROXY_STOP_TIMEOUT, proxy.shutdown()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(CodexCommandRunnerError::new(error.to_string()));
-            }
-            Err(_) => {
-                return Err(CodexCommandRunnerError::new(format!(
-                    "Responses capture proxy did not stop within {:?}",
-                    DIFF_CAPTURE_PROXY_STOP_TIMEOUT
-                )));
-            }
-        }
-        self.progress.emit(
-            "codex",
-            "api.capture.completed",
-            self.api_exchanges.display().to_string(),
-        );
-        Ok(())
-    }
-}
-
-fn read_optional_codex_cloud_config_cache(auth_file: &Path) -> Result<Option<Vec<u8>>, io::Error> {
-    let Some(codex_home) = auth_file.parent() else {
-        return Ok(None);
-    };
-    let cache = codex_home.join(DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME);
-    match fs::read(cache) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-impl CodexCommandRunner for DiffVmCodexRunner {
-    fn run<'a>(
-        &'a self,
-        arguments: Vec<String>,
-        timeout: Duration,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<CodexCommandOutput, CodexCommandRunnerError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let capture_proxy = self.start_capture_proxy().await?;
-            let mut command = VmCommand::new(DIFF_CODEX_GUEST_BINARY)
-                .current_directory(&self.workspace)
-                .environment(self.environment.clone())
-                .timeout(timeout)
-                .max_output_bytes(DIFF_CODEX_OUTPUT_BYTES)
-                .mirror_output(DIFF_CODEX_LIVE_STDOUT_FILE, DIFF_CODEX_LIVE_STDERR_FILE);
-            for argument in arguments {
-                command = command.arg(argument);
-            }
-            let session = self.session.clone();
-            let command = async move { session.command(command).await };
-            tokio::pin!(command);
-            let mut progress =
-                DiffCodexProgress::new(self.progress.clone(), self.api_exchanges.clone());
-            let mut progress_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + DIFF_CODEX_PROGRESS_POLL,
-                DIFF_CODEX_PROGRESS_POLL,
-            );
-            progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let result = loop {
-                tokio::select! {
-                    result = &mut command => break result,
-                    _ = progress_interval.tick() => {
-                        progress.poll(&self.session).await;
-                    }
-                }
-            };
-            progress.poll_api(true).await;
-            self.stop_capture_proxy(capture_proxy).await?;
-            match result {
-                Ok(output) => Ok(CodexCommandOutput {
-                    status: CodexCommandStatus::Exited(output.exit_code),
-                    stdout: {
-                        progress.observe_stdout(&output.stdout, true);
-                        output.stdout
-                    },
-                    stderr: {
-                        progress.observe_stderr(&output.stderr, true);
-                        output.stderr
-                    },
-                }),
-                Err(VmToolSessionError::GuestTimeout { output, .. }) => Ok(CodexCommandOutput {
-                    status: CodexCommandStatus::TimedOut,
-                    stdout: {
-                        progress.observe_stdout(&output.stdout, true);
-                        output.stdout
-                    },
-                    stderr: {
-                        progress.observe_stderr(&output.stderr, true);
-                        output.stderr
-                    },
-                }),
-                Err(error) => Err(CodexCommandRunnerError::new(error.to_string())),
-            }
-        })
-    }
-}
-
-struct DiffCodexProgress {
-    reporter: DiffProgress,
-    api_exchanges: PathBuf,
-    api_offset: u64,
-    stdout_offset: usize,
-    stderr_offset: usize,
-    api_read_failed: bool,
-    stdout_read_failed: bool,
-    stderr_read_failed: bool,
-}
-
-impl DiffCodexProgress {
-    const fn new(reporter: DiffProgress, api_exchanges: PathBuf) -> Self {
-        Self {
-            reporter,
-            api_exchanges,
-            api_offset: 0,
-            stdout_offset: 0,
-            stderr_offset: 0,
-            api_read_failed: false,
-            stdout_read_failed: false,
-            stderr_read_failed: false,
-        }
-    }
-
-    async fn poll(&mut self, session: &VmToolSessionHandle) {
-        self.poll_api(false).await;
-        if !self.stdout_read_failed {
-            match session.read_file(DIFF_CODEX_LIVE_STDOUT_FILE).await {
-                Ok(contents) => self.observe_stdout(&contents, false),
-                Err(error) if progress_file_is_not_ready(&error) => {}
-                Err(error) => {
-                    self.stdout_read_failed = true;
-                    warn!(
-                        target: "nanocodex_eval",
-                        error = %error,
-                        "stopped polling the live stock-Codex stdout mirror"
-                    );
-                }
-            }
-        }
-        if !self.stderr_read_failed {
-            match session.read_file(DIFF_CODEX_LIVE_STDERR_FILE).await {
-                Ok(contents) => self.observe_stderr(&contents, false),
-                Err(error) if progress_file_is_not_ready(&error) => {}
-                Err(error) => {
-                    self.stderr_read_failed = true;
-                    warn!(
-                        target: "nanocodex_eval",
-                        error = %error,
-                        "stopped polling the live stock-Codex stderr mirror"
-                    );
-                }
-            }
-        }
-    }
-
-    async fn poll_api(&mut self, terminal: bool) {
-        if self.api_read_failed {
-            return;
-        }
-        let mut input = match tokio::fs::File::open(&self.api_exchanges).await {
-            Ok(input) => input,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => {
-                self.api_read_failed = true;
-                warn!(
-                    target: "nanocodex_eval",
-                    path = %self.api_exchanges.display(),
-                    %error,
-                    "stopped polling the live stock-Codex API exchange log"
-                );
-                return;
-            }
-        };
-        let length = match input.metadata().await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                self.api_read_failed = true;
-                warn!(
-                    target: "nanocodex_eval",
-                    path = %self.api_exchanges.display(),
-                    %error,
-                    "stopped polling stock-Codex API exchange metadata"
-                );
-                return;
-            }
-        };
-        if length < self.api_offset {
-            self.api_offset = 0;
-        }
-        if let Err(error) = input.seek(io::SeekFrom::Start(self.api_offset)).await {
-            self.api_read_failed = true;
-            warn!(
-                target: "nanocodex_eval",
-                path = %self.api_exchanges.display(),
-                %error,
-                "stopped seeking in the stock-Codex API exchange log"
-            );
-            return;
-        }
-        let mut pending = Vec::new();
-        if let Err(error) = input.read_to_end(&mut pending).await {
-            self.api_read_failed = true;
-            warn!(
-                target: "nanocodex_eval",
-                path = %self.api_exchanges.display(),
-                %error,
-                "stopped reading the stock-Codex API exchange log"
-            );
-            return;
-        }
-        let (lines, consumed) = newly_completed_lines(&pending, 0, terminal);
-        for line in lines {
-            match serde_json::from_slice::<serde_json::Value>(line) {
-                Ok(exchange) => self.reporter.observe_api_exchange("codex", &exchange),
-                Err(error) => warn!(
-                    target: "nanocodex_eval",
-                    comparison_arm = "codex",
-                    event_bytes = line.len(),
-                    %error,
-                    "live stock-Codex API exchange was not JSON"
-                ),
-            }
-        }
-        self.api_offset = self
-            .api_offset
-            .saturating_add(u64::try_from(consumed).unwrap_or(u64::MAX));
-    }
-
-    fn observe_stdout(&mut self, contents: &[u8], terminal: bool) {
-        let (lines, next_offset) = newly_completed_lines(contents, self.stdout_offset, terminal);
-        for line in lines {
-            let parsed = serde_json::from_slice::<serde_json::Value>(line);
-            match parsed {
-                Ok(event) => {
-                    self.reporter.observe_codex(&event);
-                }
-                Err(error) => {
-                    warn!(
-                        target: "nanocodex_eval",
-                        comparison_arm = "codex",
-                        event_bytes = line.len(),
-                        error = %error,
-                        "live stock-Codex output was not a JSON event"
-                    );
-                }
-            }
-        }
-        self.stdout_offset = next_offset;
-    }
-
-    fn observe_stderr(&mut self, contents: &[u8], terminal: bool) {
-        let (lines, next_offset) = newly_completed_lines(contents, self.stderr_offset, terminal);
-        for line in lines {
-            self.reporter.observe_codex_diagnostic(line);
-        }
-        self.stderr_offset = next_offset;
-    }
-}
-
-fn progress_file_is_not_ready(error: &VmToolSessionError) -> bool {
-    matches!(error, VmToolSessionError::Guest(message) if message.contains("No such file"))
-}
-
-fn newly_completed_lines(contents: &[u8], offset: usize, terminal: bool) -> (Vec<&[u8]>, usize) {
-    if offset > contents.len() {
-        return (Vec::new(), 0);
-    }
-    let pending = &contents[offset..];
-    let end = if terminal {
-        contents.len()
-    } else {
-        pending
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(offset, |line_end| offset + line_end + 1)
-    };
-    let lines = contents[offset..end]
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .collect();
-    (lines, end)
-}
-
 pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
+    prepare_vm_guest_runtime_from(None).await
+}
+
+pub(crate) async fn prepare_vm_guest_runtime_from(prebuilt: Option<&Path>) -> Result<PathBuf> {
     let started_at = Instant::now();
-    let prebuilt = std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from);
-    let source = resolve_vm_guest_runtime_source(prebuilt.as_deref()).await?;
+    let environment_prebuilt = std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from);
+    let prebuilt = prebuilt.or(environment_prebuilt.as_deref());
+    let source = resolve_vm_guest_runtime_source(prebuilt).await?;
     let (bytes, _) = stable_file_bytes(&source.path)?;
     validate_vm_guest_elf(&bytes, &source.path)?;
     let runtime_disk = GuestRuntimeDisk::prepare(&source.path, Path::new(DEFAULT_VM_CACHE))?;
@@ -4117,7 +3144,6 @@ mod tests {
         fs,
         future::{self, Future},
         io,
-        os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
         pin::Pin,
         time::Duration,
@@ -4139,86 +3165,16 @@ mod tests {
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
-        DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, DIFF_CODEX_CA_BUNDLE_FILENAME,
-        DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME, DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-        DiffCodexCaSource, EvalInterruptError, HostResources, InterruptListener, RetainedBuild,
-        RetainedScheduling, Run, RunInvocation, RunMeasurements, RunSummary, VmRetention,
-        finish_or_drain, finish_or_interrupt, load_tasks, newly_completed_lines,
-        read_optional_codex_cloud_config_cache, retained_retry_task_names, retained_task_durations,
-        stage_diff_codex_ca_bundle,
+        DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, EvalInterruptError, HostResources,
+        InterruptListener, RetainedBuild, RetainedScheduling, Run, RunInvocation, RunMeasurements,
+        RunSummary, VmRetention, finish_or_drain, finish_or_interrupt, load_tasks,
+        retained_retry_task_names, retained_task_durations,
     };
 
     #[derive(Parser)]
     struct TestCli {
         #[command(flatten)]
         eval: Run,
-    }
-
-    #[test]
-    fn diff_codex_auth_stages_only_the_adjacent_cloud_config_cache() {
-        let codex_home = tempfile::tempdir().unwrap();
-        let auth_file = codex_home.path().join("auth.json");
-        fs::write(&auth_file, b"auth").unwrap();
-
-        assert_eq!(
-            read_optional_codex_cloud_config_cache(&auth_file).unwrap(),
-            None
-        );
-
-        let cache_file = codex_home
-            .path()
-            .join(DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME);
-        fs::write(&cache_file, b"signed cloud config").unwrap();
-        fs::write(codex_home.path().join("config.toml"), b"ignored").unwrap();
-
-        assert_eq!(
-            read_optional_codex_cloud_config_cache(&auth_file).unwrap(),
-            Some(b"signed cloud config".to_vec())
-        );
-    }
-
-    #[test]
-    fn diff_codex_ca_bundle_is_staged_read_only() {
-        let source_directory = tempfile::tempdir().unwrap();
-        let source = source_directory.path().join("host-ca.pem");
-        fs::write(&source, b"host CA bundle").unwrap();
-        let share = tempfile::tempdir().unwrap();
-
-        let staged = stage_diff_codex_ca_bundle(
-            &DiffCodexCaSource {
-                path: source,
-                source_environment: "test",
-                guest_environment: DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-            },
-            share.path(),
-        )
-        .unwrap();
-        let staged_path = share.path().join(DIFF_CODEX_CA_BUNDLE_FILENAME);
-
-        assert_eq!(
-            staged.guest_environment,
-            DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT
-        );
-        assert_eq!(fs::read(&staged_path).unwrap(), b"host CA bundle");
-        assert_eq!(
-            fs::metadata(staged_path).unwrap().permissions().mode() & 0o777,
-            0o444
-        );
-    }
-
-    #[test]
-    fn diff_codex_progress_waits_for_complete_jsonl_records() {
-        let (lines, offset) = newly_completed_lines(b"first\nsecond", 0, false);
-        assert_eq!(lines, [b"first".as_slice()]);
-        assert_eq!(offset, 6);
-
-        let (lines, offset) = newly_completed_lines(b"first\nsecond\nthird\n", offset, false);
-        assert_eq!(lines, [b"second".as_slice(), b"third".as_slice()]);
-        assert_eq!(offset, 19);
-
-        let (lines, offset) = newly_completed_lines(b"first\nsecond\nthird\nfinal", offset, true);
-        assert_eq!(lines, [b"final".as_slice()]);
-        assert_eq!(offset, 24);
     }
 
     struct VmCapabilityVerifier {
@@ -4415,17 +3371,6 @@ mod tests {
     }
 
     #[test]
-    fn eval_image_builds_prefer_ipv4_and_use_a_sixty_minute_run_timeout() {
-        assert_eq!(
-            super::EVAL_IMAGE_BUILD_POLICY,
-            super::EvalImageBuildPolicy {
-                prefer_ipv4: true,
-                run_timeout: Duration::from_mins(60),
-            }
-        );
-    }
-
-    #[test]
     fn vm_guest_build_targets_the_unified_vm_package() {
         let command = super::vm_guest_build_command(Path::new("/tmp/nanocodex-workspace"));
         let arguments = command
@@ -4535,7 +3480,6 @@ mod tests {
         assert_eq!(cli.eval.concurrency, Some(10));
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
-        assert!(cli.eval.resolve_run().unwrap().vm);
         assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
         assert!(cli.eval.suites.is_empty());
     }
@@ -4650,7 +3594,6 @@ mod tests {
             trials: 1,
             concurrency: 1,
             max_memory_mb: None,
-            vm: true,
             vm_rootfs: None,
             vm_guest_runtime: Some(source.clone()),
             vm_retention: VmRetention::Failures,
@@ -4933,7 +3876,6 @@ mod tests {
             trials: 5,
             concurrency: 16,
             max_memory_mb: Some(49_152),
-            vm: true,
             vm_rootfs: None,
             guest_runtime: Some(super::RetainedGuestRuntime {
                 target: super::VM_GUEST_TARGET.to_owned(),
@@ -5077,10 +4019,15 @@ mod tests {
     #[test]
     fn retry_selection_distinguishes_scores_refusals_and_errors() {
         let job = tempfile::tempdir().unwrap();
+        super::write_json_atomic(
+            &job.path().join(super::INVOCATION_FILE),
+            &retained_invocation(None),
+        )
+        .unwrap();
         for (trial, result) in [
             (
                 "passed",
-                r#"{"task_name":"terminal-bench/passed","verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
+                r#"{"task_name":"terminal-bench/passed","outcome":"passed","scored":true,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
             ),
             (
                 "passed-with-cleanup-failure",
@@ -5092,27 +4039,23 @@ mod tests {
             ),
             (
                 "partially-failed",
-                r#"{"task_name":"terminal-bench/partially-failed","verifier_result":{"rewards":{"first":1.0,"second":0.0}},"exception_info":null}"#,
+                r#"{"task_name":"terminal-bench/partially-failed","outcome":"verifier_failed","scored":true,"verifier_result":{"rewards":{"first":1.0,"second":0.0}},"exception_info":null}"#,
             ),
             (
                 "failed",
-                r#"{"task_name":"terminal-bench/torch-failed","verifier_result":{"rewards":{"reward":0.0}},"exception_info":null}"#,
+                r#"{"task_name":"terminal-bench/torch-failed","outcome":"verifier_failed","scored":true,"verifier_result":{"rewards":{"reward":0.0}},"exception_info":null}"#,
             ),
             (
                 "refused",
-                r#"{"task_name":"terminal-bench/refused","verifier_result":null,"exception_info":{"exception_type":"AgentSafetyRefusalError"}}"#,
-            ),
-            (
-                "legacy-refused",
-                r#"{"task_name":"terminal-bench/legacy-refused","outcome":"safety_refusal","verifier_result":null,"exception_info":null}"#,
+                r#"{"task_name":"terminal-bench/refused","outcome":"safety_refusal","scored":false,"verifier_result":null,"exception_info":{"exception_type":"AgentSafetyRefusalError"}}"#,
             ),
             (
                 "explicit-non-refusal",
-                r#"{"task_name":"terminal-bench/explicit-non-refusal","outcome":"safety_refusal","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
+                r#"{"task_name":"terminal-bench/explicit-non-refusal","outcome":"safety_refusal","scored":false,"verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
             ),
             (
                 "errored",
-                r#"{"task_name":"terminal-bench/errored","verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
+                r#"{"task_name":"terminal-bench/errored","outcome":"infrastructure_error","scored":false,"verifier_result":null,"exception_info":{"exception_type":"VerifierError"}}"#,
             ),
             (
                 "scored-timeout-pass",
@@ -5124,15 +4067,7 @@ mod tests {
             ),
             (
                 "unscored-with-reward",
-                r#"{"task_name":"terminal-bench/unscored-with-reward","scored":false,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
-            ),
-            (
-                "legacy-timeout-pass",
-                r#"{"task_name":"terminal-bench/legacy-timeout-pass","outcome":"agent_timeout","verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
-            ),
-            (
-                "verifier-exception-pass",
-                r#"{"task_name":"terminal-bench/verifier-exception-pass","verifier_result":{"rewards":{"reward":1.0}},"exception_info":{"exception_type":"AgentTimeoutError"}}"#,
+                r#"{"task_name":"terminal-bench/unscored-with-reward","outcome":"passed","scored":false,"verifier_result":{"rewards":{"reward":1.0}},"exception_info":null}"#,
             ),
         ] {
             let directory = job.path().join(trial);
@@ -5158,7 +4093,6 @@ mod tests {
             selected.task_names,
             [
                 "terminal-bench/errored".to_owned(),
-                "terminal-bench/legacy-refused".to_owned(),
                 "terminal-bench/refused".to_owned(),
                 "terminal-bench/scored-timeout-fail".to_owned(),
                 "terminal-bench/torch-failed".to_owned(),
@@ -5168,16 +4102,6 @@ mod tests {
 
         let errors_only = retained_retry_task_names(job.path(), false, true, None).unwrap();
         assert!(errors_only.task_names.contains("terminal-bench/refused"));
-        assert!(
-            errors_only
-                .task_names
-                .contains("terminal-bench/legacy-timeout-pass")
-        );
-        assert!(
-            errors_only
-                .task_names
-                .contains("terminal-bench/verifier-exception-pass")
-        );
         assert!(
             errors_only
                 .task_names
@@ -5197,11 +4121,6 @@ mod tests {
         let refusals_only = retained_retry_task_names(job.path(), true, false, None).unwrap();
         assert!(refusals_only.task_names.contains("terminal-bench/refused"));
         assert!(
-            refusals_only
-                .task_names
-                .contains("terminal-bench/legacy-refused")
-        );
-        assert!(
             !refusals_only
                 .task_names
                 .contains("terminal-bench/explicit-non-refusal")
@@ -5216,28 +4135,41 @@ mod tests {
     #[test]
     fn retry_selection_uses_pass_at_k_across_trials() {
         let job = tempfile::tempdir().unwrap();
-        for (trial, task, verifier_result, exception_info) in [
+        super::write_json_atomic(
+            &job.path().join(super::INVOCATION_FILE),
+            &retained_invocation(None),
+        )
+        .unwrap();
+        for (trial, task, outcome, scored, verifier_result, exception_info) in [
             (
                 "eventual-pass-failed",
                 "terminal-bench/eventual-pass",
+                "verifier_failed",
+                true,
                 r#"{"rewards":{"reward":0.0}}"#,
                 "null",
             ),
             (
                 "eventual-pass-passed",
                 "terminal-bench/eventual-pass",
+                "passed",
+                true,
                 r#"{"rewards":{"reward":1.0}}"#,
                 "null",
             ),
             (
                 "scored-failure",
                 "terminal-bench/scored-failure",
+                "verifier_failed",
+                true,
                 r#"{"rewards":{"reward":0.0}}"#,
                 "null",
             ),
             (
                 "scored-failure-error",
                 "terminal-bench/scored-failure",
+                "agent_timeout",
+                false,
                 "null",
                 r#"{"exception_type":"AgentTimeoutError"}"#,
             ),
@@ -5247,7 +4179,7 @@ mod tests {
             fs::write(
                 directory.join("result.json"),
                 format!(
-                    r#"{{"task_name":"{task}","verifier_result":{verifier_result},"exception_info":{exception_info}}}"#
+                    r#"{{"task_name":"{task}","outcome":"{outcome}","scored":{scored},"verifier_result":{verifier_result},"exception_info":{exception_info}}}"#
                 ),
             )
             .unwrap();
@@ -5276,41 +4208,20 @@ mod tests {
             fs::write(
                 directory.join("result.json"),
                 format!(
-                    r#"{{"task_name":"{task}","verifier_result":{{"rewards":{{"reward":{reward}}}}},"exception_info":null}}"#
+                    r#"{{"task_name":"{task}","outcome":"{}","scored":true,"verifier_result":{{"rewards":{{"reward":{reward}}}}},"exception_info":null}}"#,
+                    if reward > 0.0 { "passed" } else { "verifier_failed" },
                 ),
             )
             .unwrap();
         }
         super::write_json_atomic(
+            &base.join(super::INVOCATION_FILE),
+            &retained_invocation(None),
+        )
+        .unwrap();
+        super::write_json_atomic(
             &child.join(super::INVOCATION_FILE),
-            &super::RunInvocation {
-                version: super::INVOCATION_VERSION,
-                nanocodex_build: super::RetainedBuild {
-                    version: "test".to_owned(),
-                    git_sha: "0123456789abcdef".to_owned(),
-                    built_at: "2026-07-28T00:00:00Z".to_owned(),
-                    executable_sha256: "abc123".to_owned(),
-                },
-                model: "gpt-5.6-sol".to_owned(),
-                tool_profile: "native_workspace".to_owned(),
-                seed: None,
-                scheduling: super::RetainedScheduling {
-                    policy: super::SCHEDULING_POLICY.to_owned(),
-                    automatic_utilization_percent: None,
-                    concurrency_source: "configured".to_owned(),
-                    memory_source: "configured".to_owned(),
-                },
-                trials: 1,
-                concurrency: 1,
-                max_memory_mb: None,
-                vm: false,
-                vm_rootfs: None,
-                guest_runtime: None,
-                vm_retention: super::VmRetention::Failures,
-                thinking: "low".to_owned(),
-                web_search: false,
-                rerun_from: Some(base.canonicalize().unwrap()),
-            },
+            &retained_invocation(Some(base.canonicalize().unwrap())),
         )
         .unwrap();
 
@@ -5323,18 +4234,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_last_run_marker_remains_readable() {
-        let root = tempfile::tempdir().unwrap();
-        let job = root.path().join("job");
-        fs::create_dir(&job).unwrap();
-        fs::write(job.join("result.json"), "{}").unwrap();
-        let marker = root.path().join(".nanoeval/last-run.json");
-        super::write_json_atomic(&marker, &super::LastRun { job: job.clone() }).unwrap();
-
-        let resolved = super::completed_job_from_last_run(None, [marker.as_path()]).unwrap();
-
-        assert_eq!(resolved, job.canonicalize().unwrap());
+    fn retained_invocation(rerun_from: Option<PathBuf>) -> super::RunInvocation {
+        super::RunInvocation {
+            version: super::INVOCATION_VERSION,
+            nanocodex_build: super::RetainedBuild {
+                version: "test".to_owned(),
+                git_sha: "0123456789abcdef".to_owned(),
+                built_at: "2026-07-28T00:00:00Z".to_owned(),
+                executable_sha256: "abc123".to_owned(),
+            },
+            model: "gpt-5.6-sol".to_owned(),
+            tool_profile: "microvm_workspace".to_owned(),
+            seed: None,
+            scheduling: super::RetainedScheduling {
+                policy: super::SCHEDULING_POLICY.to_owned(),
+                automatic_utilization_percent: None,
+                concurrency_source: "configured".to_owned(),
+                memory_source: "configured".to_owned(),
+            },
+            trials: 1,
+            concurrency: 1,
+            max_memory_mb: None,
+            vm_rootfs: None,
+            guest_runtime: None,
+            vm_retention: super::VmRetention::Failures,
+            thinking: "low".to_owned(),
+            web_search: false,
+            rerun_from,
+        }
     }
 
     #[test]

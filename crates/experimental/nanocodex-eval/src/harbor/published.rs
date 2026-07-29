@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::{fs, process::Command};
 use uuid::Uuid;
 
-use crate::{EvalCleanup, EvalOutcome, infer_retained_scored};
+use crate::{EvalCleanup, EvalOutcome};
 
 const DEFAULT_REPOSITORY: &str =
     "https://huggingface.co/datasets/harborframework/terminal-bench-2-leaderboard";
@@ -800,7 +800,7 @@ struct PublishedAgentKwargs {
 
 impl PublishedResult {
     const fn is_scored(&self) -> bool {
-        infer_retained_scored(
+        infer_published_scored(
             self.scored,
             self.outcome,
             self.verifier_result.is_some(),
@@ -861,6 +861,21 @@ impl PublishedResult {
             });
         }
         agent
+    }
+}
+
+const fn infer_published_scored(
+    scored: Option<bool>,
+    outcome: Option<EvalOutcome>,
+    verifier_present: bool,
+    exception_present: bool,
+) -> bool {
+    match scored {
+        Some(scored) => scored,
+        None => match outcome {
+            Some(outcome) => outcome.is_scored(),
+            None => verifier_present && !exception_present,
+        },
     }
 }
 

@@ -12,9 +12,8 @@ use nanocodex_eval::harbor::{
     PublishedAgentInfo, PublishedAttempts, PublishedQuery, PublishedResults, PublishedTask,
     PublishedTrajectory, PublishedTrial,
 };
-use nanocodex_eval::{EvalCleanup, EvalOutcome, infer_retained_scored};
+use nanocodex_eval::{EvalCleanup, EvalOutcome};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use tokio::task::JoinSet;
 
 #[derive(Args)]
@@ -223,20 +222,19 @@ struct LocalTrial {
     task_name: String,
     task_checksum: String,
     agent_info: LocalAgentInfo,
-    config: Option<LocalTrialConfig>,
+    config: LocalTrialConfig,
     verifier_result: Option<LocalVerifierResult>,
-    outcome: Option<EvalOutcome>,
-    scored: Option<bool>,
-    #[serde(default)]
+    outcome: EvalOutcome,
+    scored: bool,
     cleanup: EvalCleanup,
-    exception_info: Option<Box<RawValue>>,
+    exception_info: Option<LocalException>,
 }
 
 #[derive(Deserialize)]
 struct LocalAgentInfo {
     name: String,
-    version: Option<String>,
-    model_info: Option<LocalModelInfo>,
+    version: String,
+    model_info: LocalModelInfo,
 }
 
 #[derive(Deserialize)]
@@ -256,10 +254,7 @@ struct LocalAgentConfig {
 
 #[derive(Deserialize)]
 struct LocalAgentKwargs {
-    #[serde(default)]
-    effort: Option<String>,
-    #[serde(default)]
-    reasoning_effort: Option<String>,
+    effort: String,
 }
 
 #[derive(Deserialize)]
@@ -438,17 +433,8 @@ fn load_local_trial(directory: &Path) -> Result<Option<LocalTrial>> {
 
 impl LocalJobLoader {
     fn record(&mut self, job: &Path, directory: PathBuf, trial: LocalTrial) -> Result<()> {
-        let configured_thinking = trial.config.as_ref().and_then(|config| {
-            config
-                .agent
-                .kwargs
-                .effort
-                .clone()
-                .or_else(|| config.agent.kwargs.reasoning_effort.clone())
-        });
-        if let Some(thinking) = &configured_thinking {
-            self.thinking_configured.insert(thinking.clone());
-        }
+        let configured_thinking = trial.config.agent.kwargs.effort;
+        self.thinking_configured.insert(configured_thinking.clone());
         let observed_thinking = load_observed_thinking(&directory)?;
         if let Some(thinking) = &observed_thinking {
             self.thinking_observed.insert(thinking.clone());
@@ -456,40 +442,21 @@ impl LocalJobLoader {
         }
         self.agents.insert((
             trial.agent_info.name,
-            trial.agent_info.version,
-            trial
-                .agent_info
-                .model_info
-                .map_or_else(|| "unknown".to_owned(), |model| model.name),
+            Some(trial.agent_info.version),
+            trial.agent_info.model_info.name,
         ));
         let verifier_passed = trial
             .verifier_result
             .as_ref()
             .and_then(|verifier| verifier.rewards.get("reward"))
             .is_some_and(|reward| *reward > 0.0);
-        let scored = infer_retained_scored(
-            trial.scored,
-            trial.outcome,
-            trial.verifier_result.is_some(),
-            trial.exception_info.is_some(),
-        );
-        let parsed_exception = trial
-            .exception_info
-            .as_ref()
-            .and_then(|exception| serde_json::from_str::<LocalException>(exception.get()).ok());
+        let scored = trial.scored;
         let passed = scored && verifier_passed;
-        let errored = local_trial_errored(
-            trial.outcome,
-            parsed_exception.as_ref(),
-            trial.exception_info.is_some(),
-        );
-        let refused = local_trial_refused(
-            trial.outcome,
-            parsed_exception.as_ref(),
-            trial.exception_info.is_some(),
-        );
+        let errored = local_trial_errored(trial.outcome, trial.exception_info.as_ref());
+        let refused = local_trial_refused(trial.outcome, trial.exception_info.as_ref());
         let cleanup_failed = trial.cleanup.is_failed()
-            || parsed_exception
+            || trial
+                .exception_info
                 .as_ref()
                 .is_some_and(|exception| exception.exception_type == "CleanupError");
         let score = self
@@ -527,7 +494,7 @@ impl LocalJobLoader {
                 directory,
                 trial_name: trial.trial_name,
                 passed,
-                configured_thinking,
+                configured_thinking: Some(configured_thinking),
                 observed_thinking,
             });
         Ok(())
@@ -563,34 +530,22 @@ impl LocalJobLoader {
     }
 }
 
-fn local_trial_errored(
-    outcome: Option<EvalOutcome>,
-    exception: Option<&LocalException>,
-    retained_exception: bool,
-) -> bool {
-    match (exception, retained_exception) {
-        (Some(exception), _) => exception.exception_type != "CleanupError",
-        (None, true) => true,
-        (None, false) => outcome.is_some_and(|outcome| {
-            matches!(
-                outcome,
-                EvalOutcome::SafetyRefusal
-                    | EvalOutcome::AgentTimeout
-                    | EvalOutcome::InfrastructureError
-            )
-        }),
+fn local_trial_errored(outcome: EvalOutcome, exception: Option<&LocalException>) -> bool {
+    match exception {
+        Some(exception) => exception.exception_type != "CleanupError",
+        None => matches!(
+            outcome,
+            EvalOutcome::SafetyRefusal
+                | EvalOutcome::AgentTimeout
+                | EvalOutcome::InfrastructureError
+        ),
     }
 }
 
-fn local_trial_refused(
-    outcome: Option<EvalOutcome>,
-    exception: Option<&LocalException>,
-    retained_exception: bool,
-) -> bool {
-    match (exception, retained_exception) {
-        (Some(exception), _) => exception.exception_type == "AgentSafetyRefusalError",
-        (None, true) => false,
-        (None, false) => matches!(outcome, Some(EvalOutcome::SafetyRefusal)),
+fn local_trial_refused(outcome: EvalOutcome, exception: Option<&LocalException>) -> bool {
+    match exception {
+        Some(exception) => exception.exception_type == "AgentSafetyRefusalError",
+        None => outcome == EvalOutcome::SafetyRefusal,
     }
 }
 
@@ -1526,119 +1481,55 @@ mod tests {
         };
 
         assert!(local_trial_errored(
-            Some(EvalOutcome::AgentTimeout),
-            Some(&timeout),
-            true
+            EvalOutcome::AgentTimeout,
+            Some(&timeout)
         ));
-        assert!(local_trial_errored(
-            Some(EvalOutcome::SafetyRefusal),
-            None,
-            false
-        ));
-        assert!(!local_trial_errored(None, None, false));
+        assert!(local_trial_errored(EvalOutcome::SafetyRefusal, None));
+        assert!(!local_trial_errored(EvalOutcome::Passed, None));
         assert!(!local_trial_errored(
-            Some(EvalOutcome::InfrastructureError),
-            Some(&cleanup),
-            true
+            EvalOutcome::InfrastructureError,
+            Some(&cleanup)
         ));
-        assert!(local_trial_errored(
-            Some(EvalOutcome::Passed),
-            Some(&timeout),
-            true
-        ));
-        assert!(local_trial_errored(Some(EvalOutcome::Passed), None, true));
+        assert!(local_trial_errored(EvalOutcome::Passed, Some(&timeout)));
+        assert!(local_trial_refused(EvalOutcome::SafetyRefusal, None));
         assert!(local_trial_refused(
-            Some(EvalOutcome::SafetyRefusal),
-            None,
-            false
+            EvalOutcome::InfrastructureError,
+            Some(&refusal)
         ));
-        assert!(local_trial_refused(None, Some(&refusal), true));
         assert!(!local_trial_refused(
-            Some(EvalOutcome::SafetyRefusal),
-            Some(&cleanup),
-            true
+            EvalOutcome::SafetyRefusal,
+            Some(&cleanup)
         ));
     }
 
     #[test]
-    fn local_loader_uses_backward_compatible_scoring_precedence() {
-        let job = tempfile::tempdir().unwrap();
-        let mut loader = LocalJobLoader::default();
-        let cases = [
-            (
-                "explicit-scored-timeout",
-                serde_json::json!({
-                    "outcome": "agent_timeout",
-                    "scored": true,
-                    "verifier_result": {"rewards": {"reward": 1.0}},
-                    "exception_info": {"exception_type": "AgentTimeoutError"},
-                }),
-            ),
-            (
-                "legacy-timeout",
-                serde_json::json!({
-                    "outcome": "agent_timeout",
-                    "verifier_result": {"rewards": {"reward": 1.0}},
-                    "exception_info": null,
-                }),
-            ),
-            (
-                "verifier-with-exception",
-                serde_json::json!({
-                    "verifier_result": {"rewards": {"reward": 1.0}},
-                    "exception_info": {"exception_type": "AgentTimeoutError"},
-                }),
-            ),
-            (
-                "clean-verifier",
-                serde_json::json!({
-                    "verifier_result": {"rewards": {"reward": 1.0}},
-                    "exception_info": null,
-                }),
-            ),
-            (
-                "explicit-unscored-reward",
-                serde_json::json!({
-                    "outcome": "passed",
-                    "scored": false,
-                    "verifier_result": {"rewards": {"reward": 1.0}},
-                    "exception_info": null,
-                }),
-            ),
-        ];
-
-        for (trial_name, fields) in cases {
-            let directory = job.path().join(trial_name);
-            fs::create_dir(&directory).unwrap();
-            let mut value = serde_json::json!({
-                "trial_name": trial_name,
-                "task_name": "terminal-bench/task",
-                "task_checksum": "checksum",
-                "agent_info": {
-                    "name": "nanocodex",
-                    "version": null,
-                    "model_info": {"name": "gpt-test"},
+    fn local_loader_requires_the_current_result_schema() {
+        let mut value = serde_json::json!({
+            "trial_name": "current",
+            "task_name": "terminal-bench/task",
+            "task_checksum": "checksum",
+            "agent_info": {
+                "name": "nanocodex",
+                "version": "test",
+                "model_info": {"name": "gpt-test"},
+            },
+            "config": {
+                "agent": {
+                    "kwargs": {
+                        "effort": "medium",
+                    },
                 },
-                "config": null,
-                "verifier_result": null,
-                "outcome": null,
-                "scored": null,
-                "exception_info": null,
-            });
-            for (key, field) in fields.as_object().unwrap() {
-                value[key] = field.clone();
-            }
-            let trial: LocalTrial = serde_json::from_value(value).unwrap();
-            loader
-                .record(job.path(), directory, trial)
-                .expect("fixture trial must load");
-        }
+            },
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "outcome": "passed",
+            "scored": true,
+            "cleanup": EvalCleanup::default(),
+            "exception_info": null,
+        });
+        serde_json::from_value::<LocalTrial>(value.clone()).unwrap();
 
-        let score = &loader.tasks["terminal-bench/task"];
-        assert_eq!(score.attempts, 5);
-        assert_eq!(score.trials, 2);
-        assert_eq!(score.passes, 2);
-        assert_eq!(score.errors, 3);
+        value.as_object_mut().unwrap().remove("scored");
+        assert!(serde_json::from_value::<LocalTrial>(value).is_err());
     }
 
     #[test]

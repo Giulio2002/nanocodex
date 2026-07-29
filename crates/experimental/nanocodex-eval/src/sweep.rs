@@ -46,8 +46,7 @@ pub(crate) struct SweepAttempt<'a> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RunManifest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    task_digest_schema: Option<String>,
+    task_digest_schema: String,
     tasks: Vec<RunTask>,
     agents: Vec<AgentId>,
     trials: NonZeroU16,
@@ -56,10 +55,8 @@ pub(crate) struct RunManifest {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 struct RunTask {
     root: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content_digest: Option<String>,
+    name: String,
+    content_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -216,14 +213,14 @@ impl Sweep {
 
     pub(crate) fn manifest(&self) -> RunManifest {
         RunManifest {
-            task_digest_schema: Some(PACKAGE_DIGEST_SCHEMA.to_owned()),
+            task_digest_schema: PACKAGE_DIGEST_SCHEMA.to_owned(),
             tasks: self
                 .tasks
                 .iter()
                 .map(|task| RunTask {
                     root: task.root().to_path_buf(),
-                    name: Some(task.name().to_owned()),
-                    content_digest: Some(task.content_digest().to_owned()),
+                    name: task.name().to_owned(),
+                    content_digest: task.content_digest().to_owned(),
                 })
                 .collect(),
             agents: self.agents.iter().map(|agent| agent.id.clone()).collect(),
@@ -246,97 +243,17 @@ impl RunManifest {
     }
 
     pub(crate) fn task_content_digest(&self, task_root: &Path) -> Option<&str> {
-        self.tasks
-            .iter()
-            .find(|task| task.root == task_root)?
-            .content_digest
-            .as_deref()
+        Some(
+            self.tasks
+                .iter()
+                .find(|task| task.root == task_root)?
+                .content_digest
+                .as_str(),
+        )
     }
 
-    pub(crate) fn task_digest_schema(&self) -> Option<&str> {
-        self.task_digest_schema.as_deref()
-    }
-
-    pub(crate) fn missing_content_digest_roots(&self) -> impl Iterator<Item = &Path> {
-        self.tasks
-            .iter()
-            .filter(|task| task.content_digest.is_none())
-            .map(|task| task.root.as_path())
-    }
-
-    pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
-        if !self.has_compatible_coordinates(other) || !self.has_compatible_digest_schema(other) {
-            return false;
-        }
-
-        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
-        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
-        tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
-        other_tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
-        tasks.into_iter().zip(other_tasks).all(|(left, right)| {
-            left.root == right.root
-                && match (&left.name, &right.name) {
-                    (Some(left), Some(right)) => left == right,
-                    (None, _) | (_, None) => true,
-                }
-                && match (&left.content_digest, &right.content_digest) {
-                    (Some(left), Some(right)) => left == right,
-                    (None, _) | (_, None) => true,
-                }
-        })
-    }
-
-    pub(crate) fn incompatible_digest_schema(&self, current: &Self) -> Option<(String, String)> {
-        if !self.has_compatible_coordinates(current) || self.has_compatible_digest_schema(current) {
-            return None;
-        }
-        Some((
-            self.digest_schema_label().to_owned(),
-            current.digest_schema_label().to_owned(),
-        ))
-    }
-
-    pub(crate) fn has_compatible_coordinates(&self, other: &Self) -> bool {
-        if self.trials != other.trials
-            || self.agents != other.agents
-            || self.tasks.len() != other.tasks.len()
-        {
-            return false;
-        }
-        let mut tasks = self.tasks.iter().collect::<Vec<_>>();
-        let mut other_tasks = other.tasks.iter().collect::<Vec<_>>();
-        tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
-        other_tasks.sort_unstable_by(|left, right| left.root.cmp(&right.root));
-        tasks.into_iter().zip(other_tasks).all(|(left, right)| {
-            left.root == right.root
-                && match (&left.name, &right.name) {
-                    (Some(left), Some(right)) => left == right,
-                    (None, _) | (_, None) => true,
-                }
-        })
-    }
-
-    fn has_compatible_digest_schema(&self, other: &Self) -> bool {
-        match (&self.task_digest_schema, &other.task_digest_schema) {
-            (Some(left), Some(right)) => left == right,
-            (None, _) if self.tasks.iter().all(|task| task.content_digest.is_none()) => true,
-            (_, None) if other.tasks.iter().all(|task| task.content_digest.is_none()) => true,
-            (None, None) => {
-                self.tasks.iter().all(|task| task.content_digest.is_none())
-                    && other.tasks.iter().all(|task| task.content_digest.is_none())
-            }
-            (None, Some(_)) | (Some(_), None) => false,
-        }
-    }
-
-    fn digest_schema_label(&self) -> &str {
-        self.task_digest_schema.as_deref().unwrap_or_else(|| {
-            if self.tasks.iter().any(|task| task.content_digest.is_some()) {
-                "unversioned"
-            } else {
-                "digestless"
-            }
-        })
+    pub(crate) fn task_digest_schema(&self) -> &str {
+        &self.task_digest_schema
     }
 
     pub(crate) fn coordinate_for_trial(
@@ -347,11 +264,10 @@ impl RunManifest {
         attempt_id: Uuid,
     ) -> Option<RunCoordinate> {
         let task = self.tasks.iter().find(|task| task.root == task_root)?;
-        if task.name.as_deref().is_some_and(|name| name != task_name) {
+        if task.name != task_name {
             return None;
         }
-        let retained_name = task.name.as_deref().unwrap_or(task_name);
-        let short_name = retained_name.rsplit('/').next().unwrap_or(retained_name);
+        let short_name = task.name.rsplit('/').next().unwrap_or(&task.name);
         let compact_id = attempt_id.simple().to_string();
         for agent in &self.agents {
             for repetition in 1..=self.trials.get() {
@@ -388,7 +304,8 @@ impl RunCoordinate {
 
 impl PartialEq for RunManifest {
     fn eq(&self, other: &Self) -> bool {
-        if self.trials != other.trials
+        if self.task_digest_schema != other.task_digest_schema
+            || self.trials != other.trials
             || self.agents != other.agents
             || self.tasks.len() != other.tasks.len()
         {
@@ -602,42 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_without_task_names_keeps_full_root_coordinates() {
-        let sweep = Sweep::builder()
-            .task(load_task("write-greeting"))
-            .agent(
-                "default",
-                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-        let current = sweep.manifest();
-        let mut retained = serde_json::to_value(&current).unwrap();
-        retained
-            .as_object_mut()
-            .unwrap()
-            .remove("task_digest_schema");
-        let retained_task = retained["tasks"][0].as_object_mut().unwrap();
-        retained_task.remove("name");
-        retained_task.remove("content_digest");
-        let legacy: RunManifest = serde_json::from_value(retained).unwrap();
-        let task = &sweep.tasks()[0];
-        let id = Uuid::from_u128(0x1234_5678_0000_0000_0000_0000_0000_0001);
-        let trial_name = "write-greeting__default__001__12345678";
-
-        assert_ne!(legacy, current);
-        assert!(legacy.is_compatible_with(&current));
-        let coordinate = legacy
-            .coordinate_for_trial(task.root(), task.name(), trial_name, id)
-            .unwrap();
-        assert_eq!(coordinate.task_root(), task.root());
-        assert_eq!(coordinate.agent().as_str(), "default");
-        assert_eq!(coordinate.repetition(), 1);
-    }
-
-    #[test]
-    fn unversioned_digestful_manifest_is_explicitly_incompatible() {
+    fn manifest_requires_the_current_task_identity_schema() {
         let current = Sweep::builder()
             .task(load_task("write-greeting"))
             .agent(
@@ -653,13 +535,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("task_digest_schema");
-        let retained: RunManifest = serde_json::from_value(retained).unwrap();
 
-        assert_eq!(
-            retained.incompatible_digest_schema(&current),
-            Some(("unversioned".to_owned(), PACKAGE_DIGEST_SCHEMA.to_owned()))
-        );
-        assert!(!retained.is_compatible_with(&current));
+        assert!(serde_json::from_value::<RunManifest>(retained).is_err());
     }
 
     #[test]
@@ -675,35 +552,9 @@ mod tests {
             .unwrap();
         let current = sweep.manifest();
         let mut retained = current.clone();
-        retained.tasks[0].name = Some("nanoeval/renamed-task".to_owned());
+        retained.tasks[0].name = "nanoeval/renamed-task".to_owned();
 
         assert_ne!(retained, current);
-        assert!(!retained.is_compatible_with(&current));
-    }
-
-    #[test]
-    fn legacy_name_wildcard_does_not_break_manifest_equality_transitivity() {
-        let sweep = Sweep::builder()
-            .task(load_task("write-greeting"))
-            .agent(
-                "default",
-                Nanocodex::builder(OpenAi::new("test-key").unwrap()),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-        let named = sweep.manifest();
-        let mut legacy = named.clone();
-        legacy.tasks[0].name = None;
-        let mut renamed = named.clone();
-        renamed.tasks[0].name = Some("nanoeval/renamed-task".to_owned());
-
-        assert_ne!(named, legacy);
-        assert_ne!(legacy, renamed);
-        assert_ne!(named, renamed);
-        assert!(named.is_compatible_with(&legacy));
-        assert!(legacy.is_compatible_with(&renamed));
-        assert!(!named.is_compatible_with(&renamed));
     }
 
     #[test]

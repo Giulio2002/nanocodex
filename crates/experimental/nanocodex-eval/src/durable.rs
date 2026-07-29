@@ -138,20 +138,17 @@ struct RetainedTaskPath {
 #[derive(Deserialize)]
 struct RetainedTrialLock {
     task: RetainedTaskLock,
-    #[serde(default)]
-    nanocodex: Option<RetainedNanocodexTrialLock>,
+    nanocodex: RetainedNanocodexTrialLock,
 }
 
 #[derive(Deserialize)]
 struct RetainedTaskLock {
     path: PathBuf,
-    digest: String,
 }
 
 #[derive(Deserialize)]
 struct RetainedNanocodexTrialLock {
-    #[serde(default)]
-    materialization_digest_schema: Option<String>,
+    materialization_digest_schema: String,
     materialization_digest: String,
 }
 
@@ -251,27 +248,17 @@ pub(crate) fn scan_manifest_trials(
             });
         }
         if let Some(expected) = manifest.task_content_digest(&result.task_id.path) {
-            if let Some(expected_schema) = manifest.task_digest_schema() {
-                let found_schema = lock
-                    .nanocodex
-                    .as_ref()
-                    .and_then(|identity| identity.materialization_digest_schema.as_deref())
-                    .unwrap_or("unversioned");
-                if found_schema != expected_schema {
-                    return Err(DurableTrialError::TaskContentDigestSchemaMismatch {
-                        trial_name: result.trial_name,
-                        expected: expected_schema.to_owned(),
-                        found: found_schema.to_owned(),
-                    });
-                }
+            let expected_schema = manifest.task_digest_schema();
+            let found_schema = lock.nanocodex.materialization_digest_schema.as_str();
+            if found_schema != expected_schema {
+                return Err(DurableTrialError::TaskContentDigestSchemaMismatch {
+                    trial_name: result.trial_name,
+                    expected: expected_schema.to_owned(),
+                    found: found_schema.to_owned(),
+                });
             }
             let expected = format!("sha256:{expected}");
-            let found = lock
-                .nanocodex
-                .as_ref()
-                .map_or(lock.task.digest.as_str(), |identity| {
-                    identity.materialization_digest.as_str()
-                });
+            let found = lock.nanocodex.materialization_digest.as_str();
             if found != expected {
                 return Err(DurableTrialError::TaskContentDigestMismatch {
                     trial_name: result.trial_name,
@@ -461,7 +448,7 @@ mod tests {
         let lock = directory.join("lock.json");
         let mut retained: Value = serde_json::from_slice(&fs::read(&lock).unwrap()).unwrap();
         retained["nanocodex"]["materialization_digest"] = json!("sha256:stale");
-        fs::write(lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
+        fs::write(&lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
 
         let error =
             scan_manifest_trials(&fixture.job, fixture.job_id, &fixture.manifest).unwrap_err();
@@ -495,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unversioned_internal_task_identity() {
+    fn rejects_an_internal_task_identity_without_its_schema() {
         let fixture = Fixture::new(&[("task", "suite/task")], 1);
         let directory = fixture.write_trial(0, "default", 1, Uuid::now_v7());
         let lock = directory.join("lock.json");
@@ -504,20 +491,12 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("materialization_digest_schema");
-        fs::write(lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
+        fs::write(&lock, serde_json::to_vec_pretty(&retained).unwrap()).unwrap();
 
         let error =
             scan_manifest_trials(&fixture.job, fixture.job_id, &fixture.manifest).unwrap_err();
 
-        assert!(matches!(
-            error,
-            DurableTrialError::TaskContentDigestSchemaMismatch {
-                ref found,
-                ref expected,
-                ..
-            } if found == "unversioned"
-                && expected == crate::digest::PACKAGE_DIGEST_SCHEMA
-        ));
+        assert!(matches!(error, DurableTrialError::Decode { path, .. } if path == lock));
     }
 
     #[test]

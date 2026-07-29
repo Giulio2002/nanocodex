@@ -56,6 +56,8 @@ mod aggregate;
 mod atif;
 mod capture_proxy;
 mod codex;
+/// Matched Nanocodex-versus-Codex execution and retained comparison reports.
+pub mod differential;
 mod digest;
 mod durable;
 mod evaluator;
@@ -91,21 +93,27 @@ pub use codex::{
     CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
     CodexExecError, project_codex_atif,
 };
+pub use differential::{
+    CodexAuth, DifferentialBuildError, DifferentialClassification, DifferentialError,
+    DifferentialEval, DifferentialEvalBuilder, DifferentialReanalysis, DifferentialReport,
+    DifferentialResult, ExecutableIdentity, reanalyze,
+};
 pub use evaluator::{
     AttemptAgent, AttemptVerification, AttemptVerificationFailure, AttemptVerifier, EvalAttempt,
     EvalError, Evaluator, EvaluatorBuilder,
 };
 pub use event::{EvalEvent, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents};
-#[allow(deprecated)]
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,
-    EvalExceptionKind, EvalFailure, EvalFailureKind, EvalFailureTiming, EvalOutcome, EvalResult,
-    EvalStatus, EvalTiming, MeasurementCompleteness, PhaseTiming, SweepAttemptResult, SweepResults,
-    UsageTotals, VerifierResult, infer_retained_scored,
+    EvalExceptionKind, EvalFailure, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus,
+    EvalTiming, MeasurementCompleteness, PhaseTiming, SweepAttemptResult, SweepResults,
+    UsageTotals, VerifierResult,
 };
 pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{
     NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier, VerifierCollect,
     VerifierEnvironmentMode,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use vm::{CachePolicy, VmResources, VmResourcesBuilder, VmResourcesError};
