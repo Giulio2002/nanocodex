@@ -205,23 +205,27 @@ Part 3 is complete when:
 - a representative Turbo run demonstrates bounded, host-saturating execution
   on `dev-georgios`.
 
-Current status (2026-07-28): PR #58 is merged. The owned evaluator,
-Harbor-compatible presentation, `nanocodex eval` command tree, stock-Codex
-capture proxy, paired runner, semantic differ, task inventory, and running log
-are being integrated on current `master`. Earlier one-task evidence is useful
-development input but must be rerun from the new PR head. The current
+Current status (2026-07-28): PR #58 is merged. Draft PR #61 now integrates the
+owned evaluator, Harbor-compatible presentation, complete `nanocodex eval`
+command tree, stock-Codex capture proxy, paired runner, semantic differ, task
+inventory, and running log on current `master`. A fresh local smoke from
+implementation commit `cf636609a616293258f4427b86e3bb787daa2c0f` passed
+both ordinary Nanocodex evaluation and concurrent matched-profile Codex
+differential evaluation through automatically built, commit-bound guest
+runtimes. The schema-v5 differ exposed the first request drift live and
+preserved exact API, ATIF, event, and verifier evidence. The current
 per-attempt VM adapter is not yet the task-worker allocation described above,
 so no one-VM-per-task or host-saturation claim is complete.
 
 ## Current execution order
 
 1. [x] Merge the stable agent/API refactor and retained VM foundation.
-2. [ ] Integrate `nanocodex-eval` and the complete `nanocodex eval ...` CLI on
+2. [x] Integrate `nanocodex-eval` and the complete `nanocodex eval ...` CLI on
    current `master`.
-3. [ ] Rerun a local VM smoke and one paired `code_mode_only` Terminal-Bench
+3. [x] Rerun a local VM smoke and one paired `code_mode_only` Terminal-Bench
    2.1 task; inspect exact JSONL, ATIF, API capture, trajectory, and verifier
    output.
-4. [ ] Strengthen the live differ wherever that evidence exposes an ambiguous
+4. [x] Strengthen the live differ wherever that evidence exposes an ambiguous
    or late diagnosis.
 5. [ ] Implement and gate task-worker tenant isolation and the memory-weighted
    work-conserving scheduler.

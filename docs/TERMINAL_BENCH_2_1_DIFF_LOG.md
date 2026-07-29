@@ -136,6 +136,40 @@ exactly. This metadata check does not make Harbor part of task execution.
   `/private/tmp/nanocodex-tbench-2.1-diff-code-mode-only/019fab6b-4421-73a0-8f59-a14809735a9b/comparison.json`;
   `/private/tmp/nanocodex-tbench-2.1-diff-code-mode-only/019fab6b-4421-73a0-8f59-a14809735a9b/api-comparison.json`;
   `/private/tmp/nanocodex-tbench-2.1-diff-code-mode-only/019fab6b-4421-73a0-8f59-a14809735a9b/progress.jsonl`
+- 2026-07-28 (artifacts recorded in UTC on 2026-07-29): draft PR #61
+  implementation commit
+  `cf636609a616293258f4427b86e3bb787daa2c0f` passed a fresh ordinary VM
+  smoke on `nanoeval/write-greeting` without a manually supplied guest
+  runtime. The evaluator built and indexed the guest from the same host commit,
+  retained `source=host_commit_source` and the exact host SHA in
+  `invocation.json`, emitted 82 ordered agent events and an ATIF-v1.7
+  trajectory, and passed the canonical verifier with reward `1` and stdout
+  `greeting.txt is correct`.
+- The same implementation commit then ran Nanocodex and released
+  `codex-cli 0.145.0`
+  concurrently in separate microVM attempts. Both arms used `gpt-5.6-sol`,
+  medium effort, `reasoning.summary=auto`, disabled web search and multi-agent
+  execution, and the matched `code_mode_only` `exec`/`wait` profile. Both
+  passed with reward `1`.
+- Both API event loops contain four terminal Responses turns, three generation
+  turns, three valid previous-response links, two valid tool-result links, no
+  broken links, and one stable prompt-cache key. The exact model-visible tool
+  sequence is `[exec, exec]` for both arms. The live stream reported the first
+  meaningful drift at 8.418 seconds, while both attempts were still running:
+  the first-turn `exec` description bytes under `tool_configuration`.
+- Comparison schema v5 records the Nanocodex outer-and-nested tool stream and
+  stock CLI completed-item stream as different ATIF projections. It therefore
+  leaves raw trajectory tool-count deltas non-comparable instead of reporting
+  a false `4` versus `2` event-loop difference; the API-visible sequence above
+  is the comparable control-flow evidence.
+- Ordinary smoke evidence:
+  `/private/tmp/nanocodex-eval-vm-smoke.lB5CzI/019fabd1-908f-7321-9952-0bb10877f8bd/result.json`;
+  `/private/tmp/nanocodex-eval-vm-smoke.lB5CzI/019fabd1-908f-7321-9952-0bb10877f8bd/invocation.json`;
+  `/private/tmp/nanocodex-eval-vm-smoke.lB5CzI/019fabd1-908f-7321-9952-0bb10877f8bd/write-greeting__default__001__019fabd1a1e67a8392b448733826e5a6/agent/trajectory.json`
+- Paired smoke evidence:
+  `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/comparison.json`;
+  `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/api-comparison.json`;
+  `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/progress.jsonl`
 
 ## Task 1 diagnosis: `adaptive-rejection-sampler`
 
