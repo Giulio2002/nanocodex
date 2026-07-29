@@ -66,6 +66,8 @@ mod native;
 mod result;
 mod sweep;
 mod task;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod vm;
 
 pub use aggregate::{
     AggregateDataset, AggregateRunIdentity, AggregateRunTiming, AttemptBuildIdentity,

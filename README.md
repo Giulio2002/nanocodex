@@ -11,7 +11,9 @@
 
 **[Install](#install)** · **[Agent API](#minimal-api-example)** ·
 **[Thesis](#thesis)** · **[Components](#components)** ·
-**[VM-backed tools](#vm-backed-tools)** · **[Documentation](#documentation)**
+**[VM-backed tools](#vm-backed-tools)** ·
+**[Evaluation](crates/experimental/nanocodex-eval/README.md)** ·
+**[Documentation](#documentation)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -213,15 +215,17 @@ directly.
 
 ### Experimental systems components
 
-VM components live under [`crates/experimental/`](crates/experimental/README.md)
-while their public contracts mature:
+Systems components live under
+[`crates/experimental/`](crates/experimental/README.md) while their public
+contracts mature:
 
 | Package | Responsibility |
 | --- | --- |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+| [`nanocodex-eval`](crates/experimental/nanocodex-eval/README.md) | VM-backed evaluation, canonical verification, durable evidence, and live stock-Codex differential analysis |
 
-The CLI is a consumer of this crate. VM-backed tools remain opt-in for normal
-agent sessions.
+The CLI consumes both crates. VM-backed tools remain opt-in for normal agent
+sessions and mandatory for benchmark eval commands.
 
 ### CLI and language bindings
 
@@ -261,6 +265,7 @@ requirements, and macOS signing.
 - [Migration from 0.2.x](docs/MIGRATING.md)
 - [Examples](examples/README.md)
 - [Benchmarks and retained measurements](benchmarks/)
+- [VM evaluation and stock-Codex differential runs](crates/experimental/nanocodex-eval/README.md)
 - [VM-backed tools and egress](docs/VM.md)
 
 ## License

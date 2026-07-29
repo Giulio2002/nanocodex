@@ -5,6 +5,9 @@ being exercised and revised:
 
 - [`nanocodex-vm`](nanocodex-vm/README.md): VM lifecycle and image preparation
   plus retained guest-backed workspace tools.
+- [`nanocodex-eval`](nanocodex-eval/README.md): VM-backed benchmark
+  scheduling, verification, durable evidence, and live stock-Codex
+  differential analysis.
 
 Experimental means API stability, not reduced engineering standards. These
 packages remain workspace members and must pass the normal formatting, Clippy,

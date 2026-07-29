@@ -7,8 +7,8 @@ Codex CLI on Terminal-Bench 2.1.
 
 ## Run protocol
 
-- Run each task through `nanocodex eval diff` and the native `nanocodex-eval`
-  lifecycle. Do not use Harbor as a runner.
+- Run each task through `nanocodex eval diff` and the owned VM-backed
+  `nanocodex-eval` lifecycle. Do not use Harbor as a runner.
 - Give both agents the same task package, model, reasoning effort, web-search
   policy, canonical verifier, and matched Code Mode-only profile. Disable
   multi-agent execution and require both first model requests to expose exactly
@@ -37,8 +37,9 @@ exactly. This metadata check does not make Harbor part of task execution.
 
 ## Runner validation
 
-- 2026-07-28: the rebuilt native differential runner passed both arms on
-  `nanoeval/write-greeting` with reward `1`.
+- 2026-07-28: the pre-VM-invariant native differential runner passed both arms
+  on `nanoeval/write-greeting` with reward `1`. This is retained historical
+  runner evidence, not a result produced by the current benchmark CLI.
 - Both ATIF-v1.7 projections reconciled with their retained raw streams,
   verifier outputs, and final workspace bytes.
 - Evidence:

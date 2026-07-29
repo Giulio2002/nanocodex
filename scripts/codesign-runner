@@ -11,7 +11,7 @@ shift
 requires_hypervisor=false
 for argument in "$@"; do
     case "$argument" in
-        --vm|--vm=*|--vm-rootfs|--vm-rootfs=*)
+        eval|--vm|--vm=*|--vm-rootfs|--vm-rootfs=*)
             requires_hypervisor=true
             break
             ;;

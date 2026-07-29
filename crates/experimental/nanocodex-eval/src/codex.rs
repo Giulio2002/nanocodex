@@ -41,7 +41,7 @@ const SUMMARY_ITEM_LIMIT: usize = 10_000;
 const SUMMARY_LABEL_BYTES: usize = 4 * 1024;
 const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
-/// A pinned stock-Codex executable used by the native evaluator.
+/// A pinned stock-Codex executable used by the owned evaluator.
 ///
 /// This is a concrete evaluation adapter, not an SDK provider abstraction.
 /// The executable runs in the evaluator-owned disposable workspace and its

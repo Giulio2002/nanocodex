@@ -1,10 +1,7 @@
 mod cleanup;
 mod compare;
-mod config;
 mod diff;
-mod image;
 mod inspect;
-mod observability;
 mod run;
 mod vm_network;
 
@@ -18,14 +15,13 @@ use std::{
 
 use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
-use nanocodex_eval::{Task, VerifierCollect, VerifierEnvironmentMode};
-use nanocodex_vm::host::{
-    BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig, VmProcessConfig,
+use nanocodex_eval::{
+    Task, VerifierCollect, VerifierEnvironmentMode,
+    vm::{prepare_task_image, prepare_verifier_image},
 };
-use nanocodex_vm::image::{CachePolicy, DiskStatus, VmImageBuilder};
+use nanocodex_vm::host::{BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig};
+use nanocodex_vm::image::{CachePolicy, DiskStatus};
 use serde::Serialize;
-
-use self::image::{prepare_task_image, prepare_verifier_image};
 
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -181,13 +177,6 @@ enum VmCommand {
         #[arg(required = true, trailing_var_arg = true)]
         guest_command: Vec<std::ffi::OsString>,
     },
-
-    /// Enter a dedicated VMM process from a private serialized configuration.
-    #[command(hide = true)]
-    RunConfig {
-        #[arg(long)]
-        config: PathBuf,
-    },
 }
 
 #[derive(Clone)]
@@ -292,7 +281,7 @@ impl Eval {
         matches!(
             self.command,
             Some(EvalCommand::Vm {
-                command: VmCommand::Run { .. } | VmCommand::RunConfig { .. }
+                command: VmCommand::Run { .. }
             })
         )
     }
@@ -302,9 +291,6 @@ impl Eval {
             Some(EvalCommand::Vm {
                 command: command @ VmCommand::Run { .. },
             }) => run_raw_vm(command),
-            Some(EvalCommand::Vm {
-                command: VmCommand::RunConfig { config },
-            }) => run_private_vmm(config),
             _ => Err(eyre!("evaluation command is not a synchronous VM command")),
         }
     }
@@ -313,10 +299,6 @@ impl Eval {
         enable_paint();
         run(self).await
     }
-}
-
-fn run_private_vmm(config: &Path) -> Result<()> {
-    VmProcessConfig::read(config)?.run().map_err(Into::into)
 }
 
 /*
@@ -441,9 +423,7 @@ async fn prepare_tasks(
     let runtime_started = Instant::now();
     let runtime_image = run::prepare_vm_guest_runtime().await?;
     let runtime_duration = runtime_started.elapsed();
-    let builder = VmImageBuilder::new(vmm, runtime_image)
-        .vmm_args(["eval", "vm", "run-config", "--config"])
-        .firmware_directory(".cache/libkrunfw/libkrunfw");
+    let builder = run::eval_vm_image_builder(&vmm, &runtime_image);
     let mut cache_hits = 0_usize;
     let mut cache_creations = 0_usize;
     let mut failures = Vec::new();
@@ -587,7 +567,7 @@ async fn run(eval: Eval) -> Result<()> {
         Some(EvalCommand::Diff(command)) => command.run().await?,
         Some(EvalCommand::Cleanup(command)) => command.run()?,
         Some(EvalCommand::Vm {
-            command: VmCommand::Run { .. } | VmCommand::RunConfig { .. },
+            command: VmCommand::Run { .. },
         }) => {
             return Err(eyre!(
                 "VM commands must be dispatched before starting the async runtime"

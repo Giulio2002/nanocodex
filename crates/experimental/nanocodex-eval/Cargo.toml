@@ -8,13 +8,14 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Typed, durable evaluation and Harbor artifacts for Nanocodex agents"
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
+arcbox-ext4.workspace = true
 base64.workspace = true
 chrono.workspace = true
 filetime.workspace = true
@@ -24,6 +25,8 @@ hex.workspace = true
 ignore.workspace = true
 nanocodex-agent.workspace = true
 nanocodex-oai-api.workspace = true
+nanocodex-tools.workspace = true
+nanocodex-vm.workspace = true
 nix.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 serde.workspace = true

@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    convert::Infallible,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -11,35 +10,20 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::Args;
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{Thinking, agent::events::AgentEventKind};
-use nanocodex_eval::{
-    AgentResult, AtifBuilder, AtifSource, AtifStep, AtifToolCall, AtifTrajectory, AttemptAgent,
-    CodexExec, EvalAttemptOutcome, EvalEnvironment, EvalEventKind, EvalExceptionKind, EvalOutcome,
-    EvalStatus, Evaluator, EvaluatorBuilder, MeasurementCompleteness, Task, UsageTotals,
-    project_codex_atif,
-};
+use nanocodex::{agent::events::AgentEventKind, *};
+use nanocodex_eval::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
-use tokio::{
-    io::AsyncWriteExt as _,
-    process::Command,
-    sync::mpsc,
-    task::JoinHandle,
-    time::{Instant, timeout},
-};
+use tokio::{io::AsyncWriteExt as _, sync::mpsc, task::JoinHandle, time::Instant};
 use uuid::Uuid;
 
-use super::{
-    config::{AgentArgs, SharedAuth},
-    observability::ObservabilityArgs,
-    run::prepare_diff_vm_resources,
-};
+use super::run::prepare_diff_vm_resources;
+use crate::{config::EvalAgentArgs, observability::ObservabilityArgs};
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/eval-diff";
-const CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPARISON_FILE: &str = "comparison.json";
-const COMPARISON_SCHEMA_VERSION: u32 = 4;
+const COMPARISON_SCHEMA_VERSION: u32 = 5;
 const PROGRESS_FILE: &str = "progress.jsonl";
 const PROGRESS_SCHEMA_VERSION: u32 = 1;
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -49,7 +33,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 4;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Args)]
 pub(crate) struct Diff {
@@ -59,7 +43,7 @@ pub(crate) struct Diff {
     #[arg(
         long,
         value_name = "COMPARISON_DIRECTORY",
-        conflicts_with_all = ["task", "codex_bin", "vm", "vm_guest_runtime", "vm_refresh"]
+        conflicts_with_all = ["task", "codex_bin", "vm_guest_runtime", "vm_refresh"]
     )]
     reanalyze: Option<PathBuf>,
 
@@ -74,7 +58,7 @@ pub(crate) struct Diff {
 
     /// Exact stock-Codex executable to compare against Nanocodex.
     ///
-    /// With `--vm`, this must be the Linux executable that runs in the guest.
+    /// This must be the Linux executable that runs in the guest.
     #[arg(
         long,
         value_name = "EXECUTABLE",
@@ -87,16 +71,12 @@ pub(crate) struct Diff {
     #[arg(long, default_value = DEFAULT_OUTPUT_DIRECTORY)]
     output: PathBuf,
 
-    /// Run each agent in an independent libkrun microVM.
-    #[arg(long)]
-    vm: bool,
-
-    /// Use this prebuilt Nanocodex guest-runtime ELF for `--vm`.
-    #[arg(long, value_name = "ELF", requires = "vm")]
+    /// Use this prebuilt Nanocodex guest-runtime ELF.
+    #[arg(long, value_name = "ELF")]
     vm_guest_runtime: Option<PathBuf>,
 
     /// Resolve the task image at the registry instead of reusing its local resolution.
-    #[arg(long, requires = "vm")]
+    #[arg(long)]
     vm_refresh: bool,
 
     /// Print the complete comparison record as JSON.
@@ -107,7 +87,7 @@ pub(crate) struct Diff {
     observability: ObservabilityArgs,
 
     #[command(flatten)]
-    agent: AgentArgs,
+    agent: EvalAgentArgs,
 }
 
 #[derive(Serialize)]
@@ -200,6 +180,7 @@ struct TrajectorySummary {
     tool_calls: u32,
     observations: u32,
     model_calls: Option<u32>,
+    tool_projection: &'static str,
     tool_sequence: Vec<String>,
     shell_polling: ShellPollingSummary,
     usage_completeness: Option<MeasurementCompleteness>,
@@ -224,6 +205,7 @@ struct ShellPollingSummary {
 #[derive(Serialize)]
 struct TrajectoryComparison {
     comparable: bool,
+    tool_sequence_comparable: bool,
     tool_sequence_equal: Option<bool>,
     codex_minus_nanocodex: Option<TrajectoryDelta>,
 }
@@ -234,8 +216,8 @@ struct TrajectoryDelta {
     agent_steps: i64,
     message_steps: i64,
     reasoning_steps: i64,
-    tool_calls: i64,
-    observations: i64,
+    tool_calls: Option<i64>,
+    observations: Option<i64>,
     model_calls: Option<i64>,
     shell_polling: ShellPollingDelta,
 }
@@ -260,6 +242,7 @@ enum TrajectoryProjection {
 }
 
 enum CodexVersion {
+    #[cfg(test)]
     Fixed(String),
     Guest(Arc<OnceLock<String>>),
 }
@@ -267,6 +250,7 @@ enum CodexVersion {
 impl CodexVersion {
     fn resolve(&self) -> Result<String> {
         match self {
+            #[cfg(test)]
             Self::Fixed(version) => Ok(version.clone()),
             Self::Guest(version) => version
                 .get()
@@ -393,6 +377,7 @@ struct ApiEventLoopComparison {
     comparable: bool,
     request_count_equal: Option<bool>,
     chain_invariants_equal: Option<bool>,
+    model_visible_tool_sequence_equal: Option<bool>,
     aligned_turns: u64,
     nanocodex_unpaired_turns: u64,
     codex_unpaired_turns: u64,
@@ -416,6 +401,8 @@ struct ApiEventLoopArmSummary {
     generation_turns: u64,
     terminal_turns: u64,
     tool_call_turns: u64,
+    model_visible_tool_calls: u64,
+    model_visible_tool_sequence: Vec<String>,
     initial_model: Option<String>,
     initial_reasoning_effort: Option<String>,
     initial_reasoning_summary: Option<String>,
@@ -1256,7 +1243,7 @@ impl Diff {
     pub(crate) async fn run(self) -> Result<()> {
         let started_at = Utc::now();
         let started = Instant::now();
-        let _observability = self.observability.install()?;
+        let _observability = self.observability.install(false, Path::new("."))?;
         if let Some(directory) = &self.reanalyze {
             return reanalyze_comparison(directory, self.json);
         }
@@ -1305,78 +1292,44 @@ impl Diff {
         );
 
         let guest_codex_version = Arc::new(OnceLock::new());
-        let native_codex_version = if self.vm {
-            None
-        } else {
-            Some(read_codex_version(&codex_path).await?)
-        };
-        let vm_resources = if self.vm {
-            Some(Arc::new(
-                prepare_diff_vm_resources(
-                    &task,
-                    &comparison_directory,
-                    self.vm_guest_runtime.as_deref(),
-                    self.vm_refresh,
-                    web_search,
-                    &codex_path,
-                )
-                .await?,
-            ))
-        } else {
-            None
-        };
+        let vm_resources = Arc::new(
+            prepare_diff_vm_resources(
+                &task,
+                &comparison_directory,
+                self.vm_guest_runtime.as_deref(),
+                self.vm_refresh,
+                web_search,
+                &codex_path,
+            )
+            .await?,
+        );
         let codex = CodexExec::new(&codex_path, nanocodex::oai::MODEL, thinking.as_str())?
             .web_search(web_search)
             .code_mode_only();
-        let codex = if self.vm {
-            codex
-        } else {
-            configure_codex(codex, auth.clone())?
-        };
 
-        let mut nanocodex_evaluator = Evaluator::builder(nanocodex.clone())
-            .output_directory(comparison_directory.join("nanocodex"));
-        if let Some(resources) = &vm_resources {
-            let resources = Arc::clone(resources);
-            nanocodex_evaluator = nanocodex_evaluator
-                .attempt_environment(EvalEnvironment::MicroVm)
-                .attempt_agent(move |attempt, builder| {
-                    resources.nanocodex_attempt(attempt, builder)
-                });
-        }
-        let mut codex_evaluator =
-            Evaluator::builder(nanocodex).output_directory(comparison_directory.join("codex"));
+        let nanocodex_evaluator = Evaluator::builder(nanocodex.clone())
+            .output_directory(comparison_directory.join("nanocodex"))
+            .vm(vm_resources.nanocodex_backend());
+        let codex_backend = vm_resources.codex_backend();
+        let codex_resources = Arc::clone(&vm_resources);
         let codex_config = codex.clone();
-        let projection = if let Some(resources) = &vm_resources {
-            let resources = Arc::clone(resources);
-            let auth = auth.clone();
-            let version = Arc::clone(&guest_codex_version);
-            let progress = progress.clone();
-            codex_evaluator = codex_evaluator
-                .attempt_environment(EvalEnvironment::MicroVm)
-                .attempt_agent(move |attempt, _builder| {
-                    resources.codex_attempt(
-                        attempt,
-                        codex_config.clone(),
-                        auth.clone(),
-                        Arc::clone(&version),
-                        progress.clone(),
-                    )
-                });
-            TrajectoryProjection::Codex {
-                version: CodexVersion::Guest(Arc::clone(&guest_codex_version)),
-            }
-        } else {
-            codex_evaluator = codex_evaluator.attempt_agent(move |_attempt, _builder| {
-                Ok::<_, Infallible>(AttemptAgent::codex(codex_config.clone()))
+        let codex_auth = auth.clone();
+        let version = Arc::clone(&guest_codex_version);
+        let codex_progress = progress.clone();
+        let codex_evaluator = Evaluator::builder(nanocodex)
+            .output_directory(comparison_directory.join("codex"))
+            .vm_with(codex_backend, move |attempt, _builder, runtime| {
+                codex_resources.codex_attempt(
+                    runtime,
+                    attempt,
+                    codex_config.clone(),
+                    codex_auth.clone(),
+                    Arc::clone(&version),
+                    codex_progress.clone(),
+                )
             });
-            TrajectoryProjection::Codex {
-                version: CodexVersion::Fixed(
-                    native_codex_version
-                        .clone()
-                        .ok_or_else(|| eyre!("native Codex version was not prepared"))?,
-                ),
-            }
+        let projection = TrajectoryProjection::Codex {
+            version: CodexVersion::Guest(Arc::clone(&guest_codex_version)),
         };
         let (nanocodex_arm, codex_arm) = tokio::join!(
             run_arm(
@@ -1390,18 +1343,14 @@ impl Diff {
                 task.clone(),
                 codex_evaluator,
                 projection,
-                self.vm,
+                true,
                 progress.clone(),
             ),
         );
-        let codex_version = if self.vm {
-            guest_codex_version
-                .get()
-                .cloned()
-                .unwrap_or_else(|| "unavailable".to_owned())
-        } else {
-            native_codex_version.ok_or_else(|| eyre!("native Codex version was not prepared"))?
-        };
+        let codex_version = guest_codex_version
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "unavailable".to_owned());
 
         let classification = ComparisonClassification::from_arms(&nanocodex_arm, &codex_arm);
         let trajectory_comparison = TrajectoryComparison::from_arms(&nanocodex_arm, &codex_arm);
@@ -1439,7 +1388,7 @@ impl Diff {
             thinking: thinking.to_string(),
             policy: ComparisonPolicy {
                 runner: "nanocodex_eval",
-                environment: if self.vm { "micro_vm" } else { "native" },
+                environment: "micro_vm",
                 attempts_per_agent: 1,
                 execution_mode: "concurrent",
                 web_search,
@@ -1522,6 +1471,7 @@ impl ComparisonReport {
         println!("task: {}", self.task.name);
         write_arm("nanocodex", &self.nanocodex);
         write_arm("codex", &self.codex);
+        write_model_visible_tool_summary(&self.api_comparison.event_loop);
         println!("live progress: {}", self.artifacts.progress.display());
         if let Some(error) = &self.artifacts.progress_error {
             println!("live progress error: {error}");
@@ -1627,6 +1577,11 @@ impl TrajectorySummary {
                 .try_fold(0_u32, |total, step| {
                     step.llm_call_count.map(|count| total.saturating_add(count))
                 }),
+            tool_projection: match trajectory.agent.name.as_str() {
+                "nanocodex" => "lifecycle_outer_and_nested_tools",
+                "codex" => "stock_cli_completed_items",
+                _ => "atif_tool_calls",
+            },
             tool_sequence,
             shell_polling: ShellPollingSummary::new(&trajectory.steps),
             usage_completeness: trajectory.final_metrics.extra.usage_completeness,
@@ -1744,6 +1699,7 @@ impl TrajectoryComparison {
         ) else {
             return Self {
                 comparable: false,
+                tool_sequence_comparable: false,
                 tool_sequence_equal: None,
                 codex_minus_nanocodex: None,
             };
@@ -1752,17 +1708,22 @@ impl TrajectoryComparison {
     }
 
     fn from_summaries(nanocodex: &TrajectorySummary, codex: &TrajectorySummary) -> Self {
+        let tool_sequence_comparable = codex.tool_projection == nanocodex.tool_projection;
         Self {
             comparable: true,
-            tool_sequence_equal: Some(codex.tool_sequence == nanocodex.tool_sequence),
+            tool_sequence_comparable,
+            tool_sequence_equal: tool_sequence_comparable
+                .then(|| codex.tool_sequence == nanocodex.tool_sequence),
             codex_minus_nanocodex: Some(TrajectoryDelta {
                 total_steps: i64::from(codex.total_steps) - i64::from(nanocodex.total_steps),
                 agent_steps: i64::from(codex.agent_steps) - i64::from(nanocodex.agent_steps),
                 message_steps: i64::from(codex.message_steps) - i64::from(nanocodex.message_steps),
                 reasoning_steps: i64::from(codex.reasoning_steps)
                     - i64::from(nanocodex.reasoning_steps),
-                tool_calls: i64::from(codex.tool_calls) - i64::from(nanocodex.tool_calls),
-                observations: i64::from(codex.observations) - i64::from(nanocodex.observations),
+                tool_calls: tool_sequence_comparable
+                    .then(|| i64::from(codex.tool_calls) - i64::from(nanocodex.tool_calls)),
+                observations: tool_sequence_comparable
+                    .then(|| i64::from(codex.observations) - i64::from(nanocodex.observations)),
                 model_calls: codex
                     .model_calls
                     .zip(nanocodex.model_calls)
@@ -2652,7 +2613,7 @@ fn required_retained_artifact_path(
 
 fn write_shell_polling_summary(name: &str, summary: &ShellPollingSummary) {
     println!(
-        "{name} shell polling: {} observed poll-only steps · {} confirmed model calls · {} sessions · {} input/{} output tokens · {:.1}s model time",
+        "{name} shell polling: {} observed poll-only steps · {} confirmed poll-only model calls · {} sessions · {} input/{} output tokens · {:.1}s model time",
         summary.poll_only_steps,
         summary
             .confirmed_model_calls
@@ -2670,10 +2631,12 @@ fn write_event_loop_arm_summary(name: &str, summary: Option<&ApiEventLoopArmSumm
         return;
     };
     println!(
-        "{name} event loop: {}/{} terminal · {} generation turns · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {}/{} broken · tool-result links {}/{} broken · cache stable {}",
+        "{name} event loop: {}/{} terminal · {} generation turns · model-visible calls {} [{}] · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {}/{} broken · tool-result links {}/{} broken · cache stable {}",
         summary.terminal_turns,
         summary.turns,
         summary.generation_turns,
+        summary.model_visible_tool_calls,
+        summary.model_visible_tool_sequence.join(", "),
         summary.initial_model.as_deref().unwrap_or("unobserved"),
         summary
             .initial_reasoning_effort
@@ -2692,6 +2655,21 @@ fn write_event_loop_arm_summary(name: &str, summary: Option<&ApiEventLoopArmSumm
         summary
             .prompt_cache_key_stable
             .map_or("unobserved", |stable| if stable { "yes" } else { "no" }),
+    );
+}
+
+fn write_model_visible_tool_summary(comparison: &ApiEventLoopComparison) {
+    let (Some(nanocodex), Some(codex)) = (comparison.nanocodex.as_ref(), comparison.codex.as_ref())
+    else {
+        return;
+    };
+    println!(
+        "model-visible tool sequence: nanocodex [{}] · codex [{}] · match {}",
+        nanocodex.model_visible_tool_sequence.join(", "),
+        codex.model_visible_tool_sequence.join(", "),
+        comparison
+            .model_visible_tool_sequence_equal
+            .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
     );
 }
 
@@ -2881,10 +2859,18 @@ fn compare_api_exchanges(
         .as_ref()
         .zip(codex_event_loop.as_ref())
         .map(|(nanocodex, codex)| nanocodex.summary.chain_invariants_equal(&codex.summary));
+    let model_visible_tool_sequence_equal = nanocodex_event_loop
+        .as_ref()
+        .zip(codex_event_loop.as_ref())
+        .map(|(nanocodex, codex)| {
+            nanocodex.summary.model_visible_tool_sequence
+                == codex.summary.model_visible_tool_sequence
+        });
     let event_loop = ApiEventLoopComparison {
         comparable,
         request_count_equal,
         chain_invariants_equal,
+        model_visible_tool_sequence_equal,
         aligned_turns: u64::try_from(aligned_request_count).unwrap_or(u64::MAX),
         nanocodex_unpaired_turns: u64::try_from(nanocodex_unpaired_request_count)
             .unwrap_or(u64::MAX),
@@ -2948,6 +2934,7 @@ impl ApiEventLoopComparison {
             comparable: false,
             request_count_equal: None,
             chain_invariants_equal: None,
+            model_visible_tool_sequence_equal: None,
             aligned_turns: 0,
             nanocodex_unpaired_turns: 0,
             codex_unpaired_turns: 0,
@@ -3084,6 +3071,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let mut generation_turns = 0_u64;
     let mut terminal_turns = 0_u64;
     let mut tool_call_turns = 0_u64;
+    let mut model_visible_tool_sequence = Vec::new();
     let mut detected_poll_only_turns = 0_u64;
     let mut consecutive_detected_poll_only_turns = 0_u64;
     let mut max_consecutive_detected_poll_only_turns = 0_u64;
@@ -3149,12 +3137,13 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
         };
         let normalized_response =
             event_loop_response_signature(&request.response_events, &response_context);
-        if response_tool_items(&request.response_events)
-            .next()
-            .is_some()
-        {
+        let response_tools = response_tool_items(&request.response_events)
+            .filter_map(visible_tool_name)
+            .collect::<Vec<_>>();
+        if !response_tools.is_empty() {
             tool_call_turns = tool_call_turns.saturating_add(1);
         }
+        model_visible_tool_sequence.extend(response_tools);
         if generation {
             if let Some(polling) = detected_polling_turn(&request.response_events) {
                 detected_poll_only_turns = detected_poll_only_turns.saturating_add(1);
@@ -3198,6 +3187,9 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             generation_turns,
             terminal_turns,
             tool_call_turns,
+            model_visible_tool_calls: u64::try_from(model_visible_tool_sequence.len())
+                .unwrap_or(u64::MAX),
+            model_visible_tool_sequence,
             initial_model,
             initial_reasoning_effort,
             initial_reasoning_summary,
@@ -3625,41 +3617,6 @@ fn json_pointer_child(parent: &str, key: &str) -> String {
     format!("{parent}/{}", key.replace('~', "~0").replace('/', "~1"))
 }
 
-async fn read_codex_version(binary: &Path) -> Result<String> {
-    let mut command = Command::new(binary);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = timeout(CODEX_VERSION_TIMEOUT, command.output())
-        .await
-        .wrap_err("timed out reading Codex version")?
-        .wrap_err_with(|| format!("failed to run {} --version", binary.display()))?;
-    if !output.status.success() {
-        return Err(eyre!(
-            "{} --version exited with {}: {}",
-            binary.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let version = String::from_utf8(output.stdout)
-        .wrap_err("Codex --version output is not valid UTF-8")?
-        .trim()
-        .to_owned();
-    if version.is_empty() {
-        return Err(eyre!("{} --version returned no version", binary.display()));
-    }
-    Ok(version)
-}
-
-fn configure_codex(codex: CodexExec, auth: SharedAuth) -> Result<CodexExec> {
-    match auth {
-        SharedAuth::ApiKey(api_key) => Ok(codex.api_key(api_key)),
-        SharedAuth::AuthFile(path) => Ok(codex.auth_file(path)?),
-    }
-}
-
 fn prepare_output_parent(output: &Path) -> Result<PathBuf> {
     fs::create_dir_all(output)
         .wrap_err_with(|| format!("failed to create output directory {}", output.display()))?;
@@ -3758,9 +3715,9 @@ fn write_arm(name: &str, arm: &ArmReport) {
         .tool_calls
         .map_or_else(|| "unknown".to_owned(), |calls| calls.to_string());
     if reward.is_empty() {
-        println!("{name}: {status} tools={tools}");
+        println!("{name}: {status} observed_tool_events={tools}");
     } else {
-        println!("{name}: {status} {reward} tools={tools}");
+        println!("{name}: {status} {reward} observed_tool_events={tools}");
     }
     if let Some(trajectory) = &arm.trajectory {
         println!("{name} trajectory: {}", trajectory.display());
@@ -3768,7 +3725,13 @@ fn write_arm(name: &str, arm: &ArmReport) {
     if let Some(summary) = &arm.trajectory_summary {
         let polling = &summary.shell_polling;
         println!(
-            "{name} shell polling: {} observed poll-only steps · {} confirmed model calls · {} input/{} output tokens · {:.1}s model time",
+            "{name} trajectory tools: {} [{}] ({})",
+            summary.tool_calls,
+            summary.tool_sequence.join(", "),
+            summary.tool_projection,
+        );
+        println!(
+            "{name} shell polling: {} observed poll-only steps · {} confirmed poll-only model calls · {} input/{} output tokens · {:.1}s model time",
             polling.poll_only_steps,
             polling
                 .confirmed_model_calls
@@ -3791,6 +3754,8 @@ fn write_arm(name: &str, arm: &ArmReport) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::convert::Infallible;
+
     use std::{
         fs,
         os::unix::fs::PermissionsExt as _,
@@ -3802,7 +3767,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ApiRequestPayload, ArmStatus, CodexExec, CodexVersion, DiffProgress, Evaluator, Infallible,
+        ApiRequestPayload, ArmStatus, CodexExec, CodexVersion, DiffProgress, Evaluator,
         LaneProgressState, ShellPollingSummary, Task, TrajectoryProjection, build_event_loop_trace,
         compare_api_exchanges, detected_code_mode_empty_stdin_calls, detected_polling_turn,
         diff_json, event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
@@ -4205,7 +4170,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 4);
+        assert_eq!(report["schema_version"], 5);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -4228,6 +4193,36 @@ mod tests {
         assert_eq!(right.summary.broken_previous_response_links, 0);
         assert_eq!(left.summary.prompt_cache_key_stable, Some(true));
         assert_eq!(right.summary.prompt_cache_key_stable, Some(true));
+    }
+
+    #[test]
+    fn event_loop_summary_compares_model_visible_tool_sequences() {
+        let mut left = event_loop_fixture("left-session", "left-cache", "left-response");
+        let mut right = event_loop_fixture("right-session", "right-cache", "right-response");
+        for requests in [&mut left, &mut right] {
+            requests[1].response_events.insert(
+                1,
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": "call-1",
+                        "input": "text(await tools.exec_command({cmd: \"true\"}));"
+                    }
+                }),
+            );
+        }
+
+        let left = build_event_loop_trace(&left);
+        let right = build_event_loop_trace(&right);
+
+        assert_eq!(left.summary.model_visible_tool_calls, 1);
+        assert_eq!(left.summary.model_visible_tool_sequence, ["exec"]);
+        assert_eq!(
+            left.summary.model_visible_tool_sequence,
+            right.summary.model_visible_tool_sequence
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ checkpoint:
 
 ### Part 2 — Retained VM foundations
 
-PR #58 added the VM machinery used by interactive agents and native
+PR #58 added the VM machinery used by interactive agents and owned
 evaluation:
 
 - retained libkrun workspaces and VM-backed workspace tools;
@@ -50,23 +50,30 @@ evaluation:
 Part 2 supplies isolation primitives. It does not make Harbor the evaluation
 runner and it does not by itself claim a host-saturating benchmark scheduler.
 
-### Part 3 — Native evaluation, Codex differential parity, and fast experiments
+### Part 3 — VM evaluation, Codex differential parity, and fast experiments
 
-Part 3 is a new first-class evaluation feature implemented by
-`nanocodex-eval` and the complete `nanocodex eval ...` CLI. Nanoeval code owns
-task loading, scheduling, execution, verification, durable records,
-aggregation, and comparison. Harbor-compatible JSONL/ATIF and archive
-comparison are presentation and interoperability formats only; no Harbor
-runner participates in execution.
+Part 3 is a new first-class evaluation feature implemented by composing
+`nanocodex-agent` and `nanocodex-vm` behind the builders in
+`nanocodex-eval`, then exposing those builders through the complete
+`nanocodex eval ...` CLI. Nanoeval code owns task loading, scheduling,
+execution, verification, durable records, aggregation, and comparison.
+Harbor-compatible JSONL/ATIF and archive comparison are presentation and
+interoperability formats only; no Harbor runner participates in execution.
 
-#### 1. Complete native command surface
+Every benchmark attempt uses a VM-backed task environment. Host execution is
+not a benchmark mode and is not exposed by the eval CLI; it may exist only as
+a focused library test fixture. The Nanocodex driver may remain in the host
+process while its workspace tools and verifier execute in the guest. The
+released stock-Codex binary executes inside its own matched guest.
+
+#### 1. Complete command surface
 
 Support both ordinary Nanocodex evaluation and differential evaluation from
 one executable:
 
 - `nanocodex eval` runs one or more tasks or suites with configurable trials,
-  retries, concurrency, memory limits, retained jobs, resume, VM policy, and
-  agent settings.
+  retries, concurrency, memory limits, retained jobs, resume, VM image/runtime
+  policy, and agent settings.
 - `nanocodex eval prepare`, `task`, `inspect`, `compare`, and `cleanup` manage
   task inputs and exact retained evidence.
 - `nanocodex eval vm ...` exposes the low-level image/VMM diagnostic boundary.
@@ -131,7 +138,8 @@ sampling, tool execution, verifier interaction, or scheduler contention.
 The primary throughput target is `ssh ubuntu@dev-georgios`. Turbo evaluation
 must keep the host busy across many Terminal-Bench tasks, efforts,
 implementations, modes, and repetitions without multiplying idle VM memory by
-every matrix coordinate.
+every matrix coordinate. VM isolation is invariant in both low-contention and
+Turbo runs; Turbo changes allocation and admission, not the trust boundary.
 
 The target allocation unit is one task-worker VM per active benchmark task.
 Within it, each
@@ -183,7 +191,7 @@ coordinates needed to test it.
 Part 3 is complete when:
 
 - the full CLI surface compiles and has focused deterministic tests;
-- ordinary native eval and paired Codex diff both pass a fresh local smoke from
+- ordinary VM eval and paired VM Codex diff both pass a fresh local smoke from
   `master`;
 - the complete Terminal-Bench 2.1 task list and running comparison log are
   retained on disk;
@@ -197,7 +205,7 @@ Part 3 is complete when:
 - a representative Turbo run demonstrates bounded, host-saturating execution
   on `dev-georgios`.
 
-Current status (2026-07-28): PR #58 is merged. The native evaluator,
+Current status (2026-07-28): PR #58 is merged. The owned evaluator,
 Harbor-compatible presentation, `nanocodex eval` command tree, stock-Codex
 capture proxy, paired runner, semantic differ, task inventory, and running log
 are being integrated on current `master`. Earlier one-task evidence is useful
@@ -210,7 +218,7 @@ so no one-VM-per-task or host-saturation claim is complete.
 1. [x] Merge the stable agent/API refactor and retained VM foundation.
 2. [ ] Integrate `nanocodex-eval` and the complete `nanocodex eval ...` CLI on
    current `master`.
-3. [ ] Rerun a local native smoke and one paired `code_mode_only` Terminal-Bench
+3. [ ] Rerun a local VM smoke and one paired `code_mode_only` Terminal-Bench
    2.1 task; inspect exact JSONL, ATIF, API capture, trajectory, and verifier
    output.
 4. [ ] Strengthen the live differ wherever that evidence exposes an ambiguous

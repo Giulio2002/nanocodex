@@ -4457,6 +4457,7 @@ dependencies = [
 name = "nanocodex-eval"
 version = "0.3.0"
 dependencies = [
+ "arcbox-ext4",
  "async-trait",
  "axum",
  "base64",
@@ -4470,6 +4471,7 @@ dependencies = [
  "nanocodex-agent",
  "nanocodex-oai-api",
  "nanocodex-tools",
+ "nanocodex-vm",
  "nix 0.31.3",
  "reqwest",
  "serde",

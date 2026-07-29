@@ -1,12 +1,10 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     fs,
     future::Future,
     io::{self, Read, Write},
     net::{Ipv4Addr, TcpListener},
-    num::ParseFloatError,
     path::{Component, Path, PathBuf},
     pin::Pin,
     str::FromStr,
@@ -17,36 +15,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-use arcbox_ext4::{
-    Formatter, Reader,
-    constants::{file_mode, make_mode},
-};
+use arcbox_ext4::Reader;
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use eyre::{Result, eyre};
-use fs2::FileExt as _;
-use nanocodex::{
-    NanocodexBuilder, Thinking, Tools,
-    tools::{ToolsBuildError, standard::UpdatePlanTool},
-};
-use nanocodex_eval::harbor::{Harbor, HarborJob, HarborRecorder};
-use nanocodex_eval::{
-    AggregateRunIdentity, AggregateRunTiming, AttemptAgent, AttemptBuildIdentity,
-    AttemptVerification, AttemptVerificationFailure, AttemptVerifier, AttemptVmIdentity,
-    BillingCompleteness, CleanupPhase, CodexCommandOutput, CodexCommandRunner,
-    CodexCommandRunnerError, CodexCommandStatus, CodexExec, EvalAttempt, EvalAttemptOutcome,
-    EvalEnvironment, EvalEventKind, EvalEventStream, EvalExceptionKind, EvalFailure, EvalOutcome,
-    EvalResult, EvalStatus, Evaluator, EvaluatorBuilder, MeasurementCompleteness, NetworkPolicy,
-    PhaseTiming, ResponsesCaptureProxy, ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride,
-    Sweep, SweepResults, Task, TaskLoadError, VerifierEnvironmentMode, VerifierResult,
-    infer_retained_scored,
-};
-use nanocodex_vm::host::{BlockDevice, GuestCommand, Network, SharedDirectory, VmConfig};
-use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
-use nanocodex_vm::tools::{
-    GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmCommandPartialOutput,
-    VmToolSession, VmToolSessionError, VmToolSessionHandle,
-};
+use nanocodex::*;
+use nanocodex_eval::{harbor::*, vm::*, *};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -56,15 +30,13 @@ use tokio::{
     process::Command,
     sync::watch,
 };
-use tracing::{info, info_span, warn};
+use tracing::{info, warn};
 use yansi::Painted;
 
-use super::{
-    config::{AgentArgs, SharedAuth},
-    diff::DiffProgress,
-    image::{prepare_task_image, prepare_verifier_image},
+use super::{diff::DiffProgress, vm_network::prepare_gvproxy};
+use crate::{
+    config::{EvalAgentArgs, SharedAuth},
     observability::ObservabilityArgs,
-    vm_network::{Gvproxy, GvproxyError, prepare_gvproxy},
 };
 
 const DEFAULT_OUTPUT_DIRECTORY: &str = ".nanocodex/evals";
@@ -130,11 +102,7 @@ pub(crate) struct Run {
     #[arg(long)]
     json: bool,
 
-    /// Run workspace tools inside a libkrun microVM.
-    #[arg(long)]
-    vm: bool,
-
-    /// Override the prepared rootfs directory or raw ext4 image used by `--vm`.
+    /// Override the prepared task rootfs directory or raw ext4 image.
     #[arg(long, value_name = "PATH")]
     vm_rootfs: Option<PathBuf>,
 
@@ -145,7 +113,7 @@ pub(crate) struct Run {
     vm_guest_runtime: Option<PathBuf>,
 
     /// Resolve the task image at the registry instead of reusing its local resolution.
-    #[arg(long, requires = "vm", conflicts_with = "vm_rootfs")]
+    #[arg(long, conflicts_with = "vm_rootfs")]
     vm_refresh: bool,
 
     /// Writable VM root-disk retention policy.
@@ -153,7 +121,7 @@ pub(crate) struct Run {
     vm_retention: Option<VmRetention>,
 
     #[command(flatten)]
-    agent: AgentArgs,
+    agent: EvalAgentArgs,
 }
 
 #[derive(Args)]
@@ -543,13 +511,11 @@ impl Run {
             .vm_guest_runtime
             .clone()
             .or_else(|| std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from));
-        let vm = self.vm
-            || retained_invocation
-                .as_ref()
-                .is_some_and(|invocation| invocation.vm)
-            || rerun
-                .as_ref()
-                .is_some_and(|rerun| retained_job_used_vm(&rerun.job));
+        // Evaluation always executes workspace tools and verification in a
+        // microVM. `vm` remains in the retained invocation schema so an
+        // incomplete pre-invariant host job cannot be resumed into a mixed
+        // execution environment.
+        let vm = true;
         let scheduling = self.resolve_scheduling(retained_invocation.as_ref(), legacy.as_ref());
         Ok(ResolvedRun {
             task_paths,
@@ -592,7 +558,7 @@ impl Run {
             return Ok(());
         };
         let observability_started = Instant::now();
-        let _observability = self.observability.install()?;
+        let _observability = self.observability.install(false, Path::new("."))?;
         let observability = observability_started.elapsed();
         let (tasks, task_loading) =
             load_prioritized_tasks(resolved.task_paths.clone(), &resolved.output)?;
@@ -601,55 +567,16 @@ impl Run {
         let nanocodex = self.agent.builder(resolved.thinking, resolved.web_search)?;
         let (mut evaluator, sweep, attempt_count) =
             Self::build_evaluator(&resolved, tasks.clone(), nanocodex, new_job)?;
-        let vm_backend = resolved.vm || resolved.vm_rootfs.is_some();
-        let vm_resources = vm_backend.then(|| Arc::new(OnceLock::<VmRunResources>::new()));
-        if let Some(resources) = &vm_resources {
-            let resources = Arc::clone(resources);
-            evaluator = evaluator
-                .attempt_environment(EvalEnvironment::MicroVm)
-                .attempt_agent(move |attempt, builder| {
-                    let resources = resources
-                        .get()
-                        .ok_or(VmAttemptError::RunResourcesNotPrepared)?;
-                    let environment = resources
-                        .environments
-                        .get(attempt.task().root())
-                        .ok_or_else(|| {
-                            VmAttemptError::MissingPreparedEnvironment(
-                                attempt.task().root().to_path_buf(),
-                            )
-                        })?;
-                    let runtime = vm_attempt(
-                        environment,
-                        VmAttemptHost {
-                            runtime_image: &resources.runtime_image,
-                            vmm: &resources.vmm,
-                            gvproxy: resources.gvproxy.as_deref(),
-                            retain_passed_rootfs: resources.retain_passed_rootfs,
-                            web_search: resources.web_search,
-                            shared_directories: &[],
-                        },
-                        attempt,
-                    )?;
-                    let readiness = runtime
-                        .verifier
-                        .agent_session
-                        .as_ref()
-                        .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
-                        .handle();
-                    Ok::<_, VmAttemptError>(
-                        AttemptAgent::new(builder.tools(runtime.tools))
-                            .ready(async move { readiness.ready().await })
-                            .verifier(runtime.verifier),
-                    )
-                });
-        }
+        let vm_backend = VmBackend::builder()
+            .retain_passed_rootfs(resolved.vm_retention.retains_passes())
+            .web_search(resolved.web_search)
+            .build();
+        evaluator = evaluator.vm(vm_backend.clone());
         let (eval, events) = evaluator.build()?;
         let mut evaluation_setup = evaluation_setup_started.elapsed();
         let remaining_attempts = eval.remaining_attempts(&sweep)?;
         let skipped_attempts = attempt_count.saturating_sub(remaining_attempts);
         let (vmm, runtime_image, guest_runtime, vm_runtime) = prepare_run_vm(
-            resolved.vm,
             resolved.vm_rootfs.as_deref(),
             resolved.vm_guest_runtime.as_deref(),
             eval.directory(),
@@ -664,33 +591,19 @@ impl Run {
             &resolved.invocation(guest_runtime.clone())?,
         )?;
         evaluation_setup += invocation_started.elapsed();
-        let gvproxy = prepare_task_network(vm_backend, &tasks).await?;
+        let gvproxy = prepare_task_network(true, &tasks).await?;
         let vm_environments_started = Instant::now();
-        let vm_environments = prepare_run_environments(
-            &tasks,
-            &resolved,
-            self.vm_refresh,
-            &vmm,
-            &runtime_image,
-            gvproxy.as_deref(),
-        )
-        .await?;
-        let vm_environments_duration = vm_environments_started.elapsed();
-        if let Some(resources) = vm_resources {
-            let environments = vm_environments.ok_or_else(|| {
-                eyre!("VM execution was selected without prepared attempt environments")
-            })?;
-            resources
-                .set(VmRunResources {
-                    environments,
-                    runtime_image,
-                    vmm,
-                    gvproxy,
-                    retain_passed_rootfs: resolved.vm_retention.retains_passes(),
-                    web_search: resolved.web_search,
-                })
-                .map_err(|_| eyre!("VM run resources were prepared more than once"))?;
+        let environments =
+            prepare_run_environments(&tasks, &resolved, self.vm_refresh, &vmm, &runtime_image)
+                .await?;
+        let mut configuration =
+            VmBackendConfiguration::builder(vmm, runtime_image).environments(environments);
+        if let Some(gvproxy) = gvproxy {
+            configuration = configuration.gvproxy(gvproxy);
         }
+        vm_backend.configure(configuration.build())?;
+        vm_backend.prepare_verifier_caches(&tasks).await?;
+        let vm_environments_duration = vm_environments_started.elapsed();
         report_resume(&eval, skipped_attempts, attempt_count);
         let harbor = Harbor::new(&eval)?.record(events.subscribe())?;
         let (expected_attempts, expected_attempts_rx) = watch::channel(remaining_attempts);
@@ -947,9 +860,8 @@ fn aggregate_run_identity(invocation: &RunInvocation) -> AggregateRunIdentity {
 
 impl ResolvedRun {
     fn report_configuration(&self) {
-        let environment = if self.vm { "microVM" } else { "host" };
         eprintln!(
-            "Run config: thinking={} · trials={} · concurrency={} · environment={environment} · web_search={}",
+            "Run config: thinking={} · trials={} · concurrency={} · environment=microVM · web_search={}",
             self.thinking, self.trials, self.concurrency, self.web_search
         );
         if let Some(runtime) = &self.vm_guest_runtime {
@@ -998,11 +910,7 @@ impl ResolvedRun {
                 executable_sha256,
             },
             model: nanocodex::oai::MODEL.to_owned(),
-            tool_profile: if self.vm || self.vm_rootfs.is_some() {
-                "microvm_workspace".to_owned()
-            } else {
-                "native_workspace".to_owned()
-            },
+            tool_profile: "microvm_workspace".to_owned(),
             seed: None,
             scheduling: RetainedScheduling {
                 policy: SCHEDULING_POLICY.to_owned(),
@@ -1434,14 +1342,6 @@ fn load_legacy_job_config(job: &Path) -> Result<LegacyJobConfig> {
     read_json(&job.join("config.json"))
 }
 
-fn retained_job_used_vm(job: &Path) -> bool {
-    fs::read_dir(job).is_ok_and(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.path().join("rootfs.ext4").is_file())
-    })
-}
-
 fn persist_invocation(job: &Path, invocation: &RunInvocation) -> Result<()> {
     let path = job.join(INVOCATION_FILE);
     if path.is_file() {
@@ -1519,7 +1419,6 @@ fn load_prioritized_tasks(
 }
 
 async fn prepare_run_vm(
-    vm: bool,
     rootfs: Option<&Path>,
     guest_runtime: Option<&Path>,
     job: &Path,
@@ -1529,12 +1428,9 @@ async fn prepare_run_vm(
 ) -> Result<(PathBuf, PathBuf, Option<RetainedGuestRuntime>, Duration)> {
     let vmm = std::env::current_exe()?;
     let started_at = Instant::now();
-    let origin = if vm || rootfs.is_some() {
-        retained_guest_runtime_origin(job, resumed, rerun_from, allow_uninitialized_resume)?
-    } else {
-        None
-    };
-    let runtime = prepare_runtime_for_vm(vm, rootfs, guest_runtime, job, origin.as_ref()).await?;
+    let origin =
+        retained_guest_runtime_origin(job, resumed, rerun_from, allow_uninitialized_resume)?;
+    let runtime = prepare_runtime_for_vm(rootfs, guest_runtime, job, origin.as_ref()).await?;
     Ok((vmm, runtime.disk, runtime.identity, started_at.elapsed()))
 }
 
@@ -1909,34 +1805,29 @@ async fn prepare_task_network(vm_enabled: bool, tasks: &[Task]) -> Result<Option
 
 async fn selected_vm_environments(
     tasks: &[Task],
-    vm: bool,
     rootfs: Option<PathBuf>,
     refresh: bool,
     vmm: &Path,
     runtime_image: &Path,
-) -> Result<Option<BTreeMap<PathBuf, VmEnvironment>>> {
+) -> Result<BTreeMap<PathBuf, VmEnvironment>> {
+    if let Some(task) = tasks.iter().find(|task| task.requires_compose()) {
+        return Err(eyre!(
+            "task {} requires a custom Docker Compose topology; the single-guest eval backend \
+             does not implement Compose tasks",
+            task.name()
+        ));
+    }
     if let Some(rootfs) = rootfs {
         let workspace = if rootfs.is_file() {
             "/app"
         } else {
             "/workspace"
         };
-        let environment = VmEnvironment {
-            rootfs,
-            workspace: workspace.to_owned(),
-            environment: BTreeMap::new(),
-            shell: "bash".to_owned(),
-            verifier: None,
-        };
-        return Ok(Some(
-            tasks
-                .iter()
-                .map(|task| (task.root().to_path_buf(), environment.clone()))
-                .collect(),
-        ));
-    }
-    if !vm {
-        return Ok(None);
+        let environment = VmEnvironment::new(rootfs, workspace, "bash");
+        return Ok(tasks
+            .iter()
+            .map(|task| (task.root().to_path_buf(), environment.clone()))
+            .collect());
     }
     let policy = if refresh {
         CachePolicy::Refresh
@@ -1944,17 +1835,18 @@ async fn selected_vm_environments(
         CachePolicy::Reuse
     };
     let image_builder = eval_vm_image_builder(vmm, runtime_image);
-    Ok(Some(
-        prepare_vm_environments(tasks, Path::new(DEFAULT_VM_CACHE), policy, &image_builder).await?,
-    ))
+    prepare_vm_environments(tasks, Path::new(DEFAULT_VM_CACHE), policy, &image_builder).await
 }
 
-fn eval_vm_image_builder(vmm: &Path, runtime_image: &Path) -> VmImageBuilder {
-    EVAL_IMAGE_BUILD_POLICY.apply(
-        VmImageBuilder::new(vmm, runtime_image)
-            .vmm_args(["eval", "vm", "run-config", "--config"])
-            .firmware_directory(DEFAULT_KRUNFW_DIRECTORY),
-    )
+pub(crate) fn eval_vm_image_builder(vmm: &Path, runtime_image: &Path) -> VmImageBuilder {
+    let builder = VmImageBuilder::new(vmm, runtime_image).vmm_args(["vm-run-config", "--config"]);
+    let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
+    let builder = if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
+        builder.firmware_directory(firmware)
+    } else {
+        builder
+    };
+    EVAL_IMAGE_BUILD_POLICY.apply(builder)
 }
 
 async fn prepare_run_environments(
@@ -1963,20 +1855,15 @@ async fn prepare_run_environments(
     refresh: bool,
     vmm: &Path,
     runtime_image: &Path,
-    gvproxy: Option<&Path>,
-) -> Result<Option<BTreeMap<PathBuf, VmEnvironment>>> {
-    let environments = selected_vm_environments(
+) -> Result<BTreeMap<PathBuf, VmEnvironment>> {
+    selected_vm_environments(
         tasks,
-        resolved.vm,
         resolved.vm_rootfs.clone(),
         refresh,
         vmm,
         runtime_image,
     )
-    .await?;
-    prepare_selected_verifier_caches(tasks, environments.as_ref(), vmm, runtime_image, gvproxy)
-        .await?;
-    Ok(environments)
+    .await
 }
 
 struct RunMeasurements {
@@ -2211,12 +2098,10 @@ async fn prepare_vm_environments(
                 vm_rootfs_path = %verifier.path().display(),
                 "separate verifier VM root disk ready"
             );
-            Some(VerifierVmEnvironment {
-                rootfs: verifier.path().to_path_buf(),
-                workspace: verifier.workdir().to_owned(),
-                environment: verifier.environment().clone(),
-                shell: verifier.shell().to_owned(),
-            })
+            Some(
+                VmVerifierEnvironment::new(verifier.path(), verifier.workdir(), verifier.shell())
+                    .environment(verifier.environment().clone()),
+            )
         } else {
             None
         };
@@ -2231,60 +2116,18 @@ async fn prepare_vm_environments(
         );
         environments.insert(
             task.root().to_path_buf(),
-            VmEnvironment {
-                rootfs: prepared.path().to_path_buf(),
-                workspace: prepared.workdir().to_owned(),
-                environment: prepared.environment().clone(),
-                shell: prepared.shell().to_owned(),
-                verifier,
+            match verifier {
+                Some(verifier) => {
+                    VmEnvironment::new(prepared.path(), prepared.workdir(), prepared.shell())
+                        .environment(prepared.environment().clone())
+                        .verifier(verifier)
+                }
+                None => VmEnvironment::new(prepared.path(), prepared.workdir(), prepared.shell())
+                    .environment(prepared.environment().clone()),
             },
         );
     }
     Ok(environments)
-}
-
-async fn prepare_verifier_caches(
-    tasks: &[Task],
-    environments: &BTreeMap<PathBuf, VmEnvironment>,
-    vmm: &Path,
-    runtime_image: &Path,
-    gvproxy: Option<&Path>,
-) -> Result<()> {
-    let mut prepared = BTreeSet::new();
-    for task in tasks {
-        let environment = environments
-            .get(task.root())
-            .ok_or_else(|| VmAttemptError::MissingPreparedEnvironment(task.root().to_path_buf()))?;
-        if environment.verifier.is_some() {
-            continue;
-        }
-        let Some(cache) = prepare_verifier_cache(&environment.rootfs, task)? else {
-            continue;
-        };
-        if !prepared.insert(cache.key.clone()) {
-            continue;
-        }
-        cache
-            .prepare_once(task, environment, vmm, runtime_image, gvproxy)
-            .await?;
-        task.validate_package()?;
-    }
-    Ok(())
-}
-
-async fn prepare_selected_verifier_caches(
-    tasks: &[Task],
-    environments: Option<&BTreeMap<PathBuf, VmEnvironment>>,
-    vmm: &Path,
-    runtime_image: &Path,
-    gvproxy: Option<&Path>,
-) -> Result<()> {
-    match environments {
-        Some(environments) => {
-            prepare_verifier_caches(tasks, environments, vmm, runtime_image, gvproxy).await
-        }
-        None => Ok(()),
-    }
 }
 
 #[derive(Debug)]
@@ -2294,7 +2137,6 @@ struct PreparedGuestRuntime {
 }
 
 async fn prepare_runtime_for_vm(
-    vm: bool,
     rootfs: Option<&Path>,
     guest_runtime: Option<&Path>,
     job: &Path,
@@ -2312,13 +2154,6 @@ async fn prepare_runtime_for_vm(
         ));
     }
     let block_runtime = embedded_runtime.is_none();
-    if !vm && rootfs.is_none() {
-        return Ok(PreparedGuestRuntime {
-            disk: PathBuf::new(),
-            identity: None,
-        });
-    }
-
     if let Some(origin) = origin {
         return prepare_retained_guest_runtime(job, origin, guest_runtime, block_runtime);
     }
@@ -2340,13 +2175,9 @@ async fn prepare_runtime_for_vm(
 }
 
 const EMBEDDED_GUEST_TOOL_RUNTIME: &str = "/usr/local/bin/nanocodex-vm-guest";
-const BLOCK_GUEST_TOOL_RUNTIME: &str = "/run/nanoeval/nanocodex-vm-guest";
 const GUEST_RUNTIME_DISK_BINARY_PATH: &str = "/nanocodex-vm-guest";
 const GUEST_RUNTIME_ARTIFACT_ROOT: &str = "guest-runtime/artifacts";
 const GUEST_RUNTIME_CACHE_ROOT: &str = "guest-runtime/cache";
-const GUEST_RUNTIME_BLOCK_ID: &str = "nanoeval-runtime";
-const GUEST_RUNTIME_BLOCK_DEVICE: &str = "/dev/vdb";
-const GUEST_RUNTIME_MOUNT: &str = "/run/nanoeval";
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -2372,14 +2203,10 @@ const DIFF_CODEX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const DIFF_CODEX_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_VM_CACHE: &str = ".cache/vm";
 const DEFAULT_KRUNFW_DIRECTORY: &str = ".cache/libkrunfw/libkrunfw";
-#[cfg(target_os = "linux")]
-const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.5.dylib";
-#[cfg(target_os = "linux")]
-const KRUNFW_LIBRARY_PATH_ENVIRONMENT: &str = "LD_LIBRARY_PATH";
-#[cfg(target_os = "macos")]
-const KRUNFW_LIBRARY_PATH_ENVIRONMENT: &str = "DYLD_LIBRARY_PATH";
+#[cfg(not(target_os = "macos"))]
+const KRUNFW_LIBRARY_FILENAME: &str = "libkrunfw.so.5";
 #[cfg(target_arch = "aarch64")]
 const VM_GUEST_TARGET: &str = "aarch64-unknown-linux-musl";
 #[cfg(target_arch = "x86_64")]
@@ -2390,23 +2217,10 @@ const VM_GUEST_ELF_MACHINE: u16 = 183;
 const VM_GUEST_ELF_MACHINE: u16 = 62;
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hosts");
-const VERIFIER_CACHE_VERSION: u32 = 2;
-const MINIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 512 * 1024 * 1024;
-const MAXIMUM_VERIFIER_CACHE_DISK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const VERIFIER_SETUP_MARKER: &str = "# Check if we're in a valid working directory";
-const VERIFIER_CACHE_BLOCK_ID: &str = "nanoeval-verifier-cache";
-const VERIFIER_CACHE_BLOCK_DEVICE: &str = "/dev/vdc";
-const VERIFIER_CACHE_MOUNT: &str = "/run/nanoeval-verifier-cache";
-const CACHED_VERIFIER_SCRIPT: &str = "/tmp/nanoeval-verifier.sh";
-const VERIFIER_CACHE_PREPARE_SCRIPT: &str = "/tmp/nanoeval-prepare-verifier.sh";
-const GUEST_PUBLIC_RESOLV_CONF: &str =
-    "nameserver 192.168.127.1\\nnameserver 1.1.1.1\\noptions timeout:2 attempts:5\\n";
 const EVAL_IMAGE_BUILD_POLICY: EvalImageBuildPolicy = EvalImageBuildPolicy {
     prefer_ipv4: true,
     run_timeout: Duration::from_mins(60),
 };
-const VERIFIER_NETWORK_RETRIES: usize = 4;
-const VERIFIER_NETWORK_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2426,49 +2240,10 @@ impl EvalImageBuildPolicy {
     }
 }
 
-#[derive(Clone)]
-struct VmEnvironment {
-    rootfs: PathBuf,
-    workspace: String,
-    environment: BTreeMap<String, String>,
-    shell: String,
-    verifier: Option<VerifierVmEnvironment>,
-}
-
-#[derive(Clone)]
-struct VerifierVmEnvironment {
-    rootfs: PathBuf,
-    workspace: String,
-    environment: BTreeMap<String, String>,
-    shell: String,
-}
-
-struct VmRunResources {
-    environments: BTreeMap<PathBuf, VmEnvironment>,
-    runtime_image: PathBuf,
-    vmm: PathBuf,
-    gvproxy: Option<PathBuf>,
-    retain_passed_rootfs: bool,
-    web_search: bool,
-}
-
-#[derive(Clone, Copy)]
-struct VmAttemptHost<'a> {
-    runtime_image: &'a Path,
-    vmm: &'a Path,
-    gvproxy: Option<&'a Path>,
-    retain_passed_rootfs: bool,
-    web_search: bool,
-    shared_directories: &'a [SharedDirectory],
-}
-
 pub(super) struct DiffVmResources {
     environment: VmEnvironment,
-    runtime_image: PathBuf,
-    vmm: PathBuf,
-    gvproxy: Option<PathBuf>,
-    web_search: bool,
-    codex_share: Vec<SharedDirectory>,
+    nanocodex: VmBackend,
+    codex: VmBackend,
     codex_ca_bundle: Option<DiffCodexCaBundle>,
 }
 
@@ -2495,7 +2270,6 @@ pub(super) async fn prepare_diff_vm_resources(
     };
 
     let (vmm, runtime_image, _, _) = prepare_run_vm(
-        true,
         None,
         guest_runtime,
         comparison_directory,
@@ -2507,73 +2281,69 @@ pub(super) async fn prepare_diff_vm_resources(
     let tasks = std::slice::from_ref(task);
     let gvproxy = prepare_task_network(true, tasks).await?;
     let mut environments =
-        selected_vm_environments(tasks, true, None, refresh, &vmm, &runtime_image)
-            .await?
-            .ok_or_else(|| eyre!("VM diff did not prepare a task environment"))?;
-    prepare_selected_verifier_caches(
-        tasks,
-        Some(&environments),
-        &vmm,
-        &runtime_image,
-        gvproxy.as_deref(),
-    )
-    .await?;
+        selected_vm_environments(tasks, None, refresh, &vmm, &runtime_image).await?;
     let environment = environments.remove(task.root()).ok_or_else(|| {
         eyre!(
             "VM diff did not prepare the requested task root {}",
             task.root().display()
         )
     })?;
-    Ok(DiffVmResources {
-        environment,
-        runtime_image,
-        vmm,
-        gvproxy,
-        web_search,
-        codex_share: vec![SharedDirectory::read_only(
+    let nanocodex = VmBackend::builder()
+        .retain_passed_rootfs(true)
+        .web_search(web_search)
+        .build();
+    let mut nanocodex_configuration = VmBackendConfiguration::builder(&vmm, &runtime_image)
+        .environment(task.root(), environment.clone());
+    if let Some(gvproxy) = &gvproxy {
+        nanocodex_configuration = nanocodex_configuration.gvproxy(gvproxy);
+    }
+    nanocodex.configure(nanocodex_configuration.build())?;
+    nanocodex.prepare_verifier_caches(tasks).await?;
+
+    let codex = VmBackend::builder()
+        .retain_passed_rootfs(true)
+        .web_search(web_search)
+        .shared_directory(SharedDirectory::read_only(
             DIFF_CODEX_SHARE_TAG,
             codex_share_root,
-        )],
+        ))
+        .build();
+    let mut codex_configuration = VmBackendConfiguration::builder(vmm, runtime_image)
+        .environment(task.root(), environment.clone());
+    if let Some(gvproxy) = gvproxy {
+        codex_configuration = codex_configuration.gvproxy(gvproxy);
+    }
+    codex.configure(codex_configuration.build())?;
+    Ok(DiffVmResources {
+        environment,
+        nanocodex,
+        codex,
         codex_ca_bundle,
     })
 }
 
 impl DiffVmResources {
-    pub(super) fn nanocodex_attempt(
-        &self,
-        attempt: EvalAttempt<'_>,
-        builder: nanocodex::NanocodexBuilder,
-    ) -> Result<AttemptAgent, VmAttemptError> {
-        let runtime = self.attempt(attempt, &[])?;
-        let readiness = runtime
-            .verifier
-            .agent_session
-            .as_ref()
-            .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
-            .handle();
-        Ok(AttemptAgent::new(builder.tools(runtime.tools))
-            .ready(async move { readiness.ready().await })
-            .verifier(runtime.verifier))
+    pub(super) fn nanocodex_backend(&self) -> VmBackend {
+        self.nanocodex.clone()
+    }
+
+    pub(super) fn codex_backend(&self) -> VmBackend {
+        self.codex.clone()
     }
 
     pub(super) fn codex_attempt(
         &self,
+        runtime: VmAttempt,
         attempt: EvalAttempt<'_>,
         codex: CodexExec,
         auth: SharedAuth,
         version: Arc<OnceLock<String>>,
         progress: DiffProgress,
-    ) -> Result<AttemptAgent, VmAttemptError> {
-        let runtime = self.attempt(attempt, &self.codex_share)?;
+    ) -> Result<AttemptAgent, nanocodex_eval::vm::VmAttemptError> {
         let model_catalog_override = codex
             .code_mode_only_model()
             .map(ResponsesModelCatalogOverride::code_mode_only);
-        let session = runtime
-            .verifier
-            .agent_session
-            .as_ref()
-            .ok_or(VmAttemptError::AgentSessionAlreadyFinished)?
-            .handle();
+        let session = runtime.session_handle()?;
         let runner = DiffVmCodexRunner::new(
             session,
             attempt,
@@ -2587,30 +2357,9 @@ impl DiffVmResources {
         let api_base_url = runner.api_base_url().to_owned();
         let runner = Arc::new(runner);
         let readiness = Arc::clone(&runner);
-        Ok(
-            AttemptAgent::codex(codex.api_base_url(api_base_url).command_runner(runner))
-                .ready(async move { readiness.prepare().await })
-                .verifier(runtime.verifier),
-        )
-    }
-
-    fn attempt(
-        &self,
-        attempt: EvalAttempt<'_>,
-        shared_directories: &[SharedDirectory],
-    ) -> Result<VmAttempt, VmAttemptError> {
-        vm_attempt(
-            &self.environment,
-            VmAttemptHost {
-                runtime_image: &self.runtime_image,
-                vmm: &self.vmm,
-                gvproxy: self.gvproxy.as_deref(),
-                retain_passed_rootfs: true,
-                web_search: self.web_search,
-                shared_directories,
-            },
-            attempt,
-        )
+        Ok(runtime
+            .codex(codex.api_base_url(api_base_url).command_runner(runner))
+            .ready(async move { readiness.prepare().await }))
     }
 }
 
@@ -2742,11 +2491,7 @@ impl DiffVmCodexRunner {
                 }
             }
         };
-        let mut command_environment = environment.environment.clone();
-        command_environment.extend(base_guest_environment(
-            attempt.task(),
-            &environment.workspace,
-        ));
+        let mut command_environment = environment.guest_environment(attempt.task());
         command_environment.insert("CODEX_HOME".to_owned(), DIFF_CODEX_HOME.to_owned());
         if let Some(ca_bundle) = ca_bundle {
             command_environment.insert(
@@ -2776,7 +2521,7 @@ impl DiffVmCodexRunner {
         let capture_base_url = format!("http://{DIFF_CAPTURE_PROXY_VM_HOST}:{capture_port}");
         Ok(Self {
             session,
-            workspace: environment.workspace.clone(),
+            workspace: environment.workspace().to_owned(),
             environment: command_environment.into_iter().collect(),
             auth_file,
             cloud_config_cache,
@@ -3963,1606 +3708,6 @@ fn parse_cargo_dep_info(contents: &str) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(super) enum VmAttemptError {
-    #[error("VM run resources were not prepared before attempt admission")]
-    RunResourcesNotPrepared,
-
-    #[error("no VM environment was prepared for task root {0}")]
-    MissingPreparedEnvironment(PathBuf),
-
-    #[error("the agent VM session was already finished")]
-    AgentSessionAlreadyFinished,
-
-    #[error("rootfs template is not a directory: {0}")]
-    InvalidRootfs(PathBuf),
-
-    #[error("rootfs template does not contain the guest tool runtime: {0}")]
-    MissingGuestRuntime(PathBuf),
-
-    #[error("the task requires public networking but gvproxy was not prepared")]
-    NetworkBackendNotPrepared,
-
-    #[error("rootfs entry collides with attempt data: {0}")]
-    Collision(PathBuf),
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
-
-    #[error(transparent)]
-    Session(#[from] VmToolSessionError),
-
-    #[error(transparent)]
-    Tools(#[from] ToolsBuildError),
-
-    #[error(transparent)]
-    TaskPackage(#[from] TaskLoadError),
-
-    #[error(transparent)]
-    ParseReward(#[from] ParseFloatError),
-
-    #[error(transparent)]
-    Ext4(#[from] arcbox_ext4::error::FormatError),
-
-    #[error(transparent)]
-    Network(#[from] GvproxyError),
-}
-
-struct VmAttempt {
-    tools: Tools,
-    verifier: VmVerifier,
-}
-
-struct VmVerifier {
-    agent_session: Option<VmToolSession>,
-    launch: VmLaunch,
-    separate_launch: Option<VmLaunch>,
-    cache: Option<VerifierCache>,
-    attempt_cache: Option<AttemptVerifierCache>,
-    retain_passed_rootfs: bool,
-    _network: Option<Gvproxy>,
-}
-
-#[derive(Clone)]
-struct VmLaunch {
-    root: PathBuf,
-    workspace: String,
-    shell: String,
-    runtime_image: PathBuf,
-    vmm: PathBuf,
-    cpus: u32,
-    memory_mib: u64,
-    ext4: bool,
-    resolver_configuration: String,
-    environment: BTreeMap<String, String>,
-    network_socket: Option<PathBuf>,
-    shared_directories: Vec<SharedDirectory>,
-}
-
-struct VerifierCache {
-    root: PathBuf,
-    key: String,
-    status: &'static str,
-    cacheable_start: usize,
-    cacheable_end: usize,
-    skip_setup: bool,
-    disk_bytes: u64,
-}
-
-struct AttemptVerifierCache {
-    disk: PathBuf,
-    skip_setup: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum VmProcessGroup {
-    Inherited,
-    Isolated,
-}
-
-fn vm_attempt(
-    environment: &VmEnvironment,
-    host: VmAttemptHost<'_>,
-    attempt: EvalAttempt<'_>,
-) -> Result<VmAttempt, VmAttemptError> {
-    let span = info_span!(
-        target: "nanocodex_eval",
-        "vm.attempt.setup",
-        otel.kind = "internal",
-        otel.status_code = tracing::field::Empty,
-        eval.task.name = attempt.task().name(),
-        vm.rootfs.template = %environment.rootfs.display(),
-        vm.rootfs.destination = %attempt.directory().display(),
-        vm.cpu.count = attempt.task().resources().cpus,
-        vm.memory_mib = attempt.task().resources().memory_mb,
-        status = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-        duration_ns = tracing::field::Empty,
-    );
-    let started_at = Instant::now();
-    let result = span.in_scope(|| vm_attempt_inner(environment, host, attempt));
-    record_operation(&span, started_at, &result);
-    result
-}
-
-fn vm_attempt_inner(
-    environment: &VmEnvironment,
-    host: VmAttemptHost<'_>,
-    attempt: EvalAttempt<'_>,
-) -> Result<VmAttempt, VmAttemptError> {
-    attempt.task().validate_package()?;
-    let template = &environment.rootfs;
-    let verifier_cache = if environment.verifier.is_some() {
-        None
-    } else {
-        prepare_verifier_cache(template, attempt.task())?
-    };
-    let root = materialize_attempt_root(template, host.runtime_image, attempt.directory())?;
-    let network = spawn_attempt_network(
-        attempt.task().network(),
-        host.gvproxy,
-        &attempt.directory().join("vm").join("gvproxy.log"),
-    )?;
-    let launch = VmLaunch {
-        root,
-        workspace: environment.workspace.clone(),
-        shell: environment.shell.clone(),
-        runtime_image: host.runtime_image.to_path_buf(),
-        vmm: host.vmm.to_path_buf(),
-        cpus: attempt.task().resources().cpus.clamp(1, u32::from(u8::MAX)),
-        memory_mib: attempt
-            .task()
-            .resources()
-            .memory_mb
-            .clamp(1, u64::from(u32::MAX)),
-        ext4: template.is_file(),
-        resolver_configuration: network
-            .as_ref()
-            .map_or_else(String::new, |_| GUEST_PUBLIC_RESOLV_CONF.to_owned()),
-        environment: environment.environment.clone(),
-        network_socket: network
-            .as_ref()
-            .map(|network| network.socket().to_path_buf()),
-        shared_directories: host.shared_directories.to_vec(),
-    };
-    let separate_launch = prepare_separate_verifier_launch(environment, &launch, host, attempt)?;
-    let verifier_directory = attempt.directory().join("verifier");
-    fs::create_dir_all(&verifier_directory)?;
-    let attempt_cache = verifier_cache
-        .as_ref()
-        .map(|cache| cache.materialize(&verifier_directory))
-        .transpose()?;
-    let session = launch.spawn(attempt_cache.as_ref(), VmProcessGroup::Isolated)?;
-    let vm = session.tools();
-    let tools = Tools::builder()
-        .without_defaults()
-        .web_search(host.web_search)
-        .image_generation(true)
-        .working_directory(environment.workspace.clone())
-        .default_shell(if template.is_file() {
-            &environment.shell
-        } else {
-            "sh"
-        })
-        .tool(vm.exec_command_tool())
-        .tool(vm.write_stdin_tool())
-        .tool(vm.apply_patch_tool())
-        .tool(vm.view_image_tool())
-        .tool(UpdatePlanTool::new())
-        .build()
-        .map_err(VmAttemptError::from)?;
-    Ok(VmAttempt {
-        tools,
-        verifier: VmVerifier {
-            agent_session: Some(session),
-            launch,
-            separate_launch,
-            cache: verifier_cache,
-            attempt_cache,
-            retain_passed_rootfs: host.retain_passed_rootfs,
-            _network: network,
-        },
-    })
-}
-
-fn materialize_attempt_root(
-    template: &Path,
-    runtime_image: &Path,
-    attempt_directory: &Path,
-) -> Result<PathBuf, VmAttemptError> {
-    if template.is_file() {
-        if !runtime_image.is_file() {
-            return Err(VmAttemptError::MissingGuestRuntime(
-                runtime_image.to_path_buf(),
-            ));
-        }
-        let root = attempt_directory.join("rootfs.ext4");
-        reflink_or_sparse_copy(template, &root)?;
-        return Ok(root);
-    }
-
-    if !runtime_image.is_file() {
-        return Err(VmAttemptError::MissingGuestRuntime(
-            runtime_image.to_path_buf(),
-        ));
-    }
-    let span = info_span!(
-        target: "nanocodex_eval",
-        "vm.rootfs.materialize",
-        otel.kind = "internal",
-        otel.status_code = tracing::field::Empty,
-        source = %template.display(),
-        destination = %attempt_directory.display(),
-        status = tracing::field::Empty,
-        error.message = tracing::field::Empty,
-        duration_ns = tracing::field::Empty,
-    );
-    let started_at = Instant::now();
-    let result = span.in_scope(|| materialize_rootfs(template, attempt_directory));
-    record_operation(&span, started_at, &result);
-    result?;
-    let guest_runtime = attempt_directory.join(EMBEDDED_GUEST_TOOL_RUNTIME.trim_start_matches('/'));
-    let guest_parent = guest_runtime
-        .parent()
-        .ok_or_else(|| VmAttemptError::Collision(guest_runtime.clone()))?;
-    let attempt_root = fs::canonicalize(attempt_directory)?;
-    let guest_parent = fs::canonicalize(guest_parent)?;
-    if !guest_parent.starts_with(&attempt_root) {
-        return Err(VmAttemptError::Collision(guest_parent));
-    }
-    let mut temporary = tempfile::NamedTempFile::new_in(&guest_parent)?;
-    io::copy(&mut fs::File::open(runtime_image)?, &mut temporary)?;
-    #[cfg(unix)]
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o755))?;
-    temporary
-        .persist(&guest_runtime)
-        .map_err(|error| error.error)?;
-    Ok(attempt_directory.to_path_buf())
-}
-
-fn prepare_separate_verifier_launch(
-    environment: &VmEnvironment,
-    agent: &VmLaunch,
-    host: VmAttemptHost<'_>,
-    attempt: EvalAttempt<'_>,
-) -> Result<Option<VmLaunch>, VmAttemptError> {
-    environment
-        .verifier
-        .as_ref()
-        .map(|verifier| {
-            let root = attempt.directory().join("verifier-rootfs.ext4");
-            reflink_or_sparse_copy(&verifier.rootfs, &root)?;
-            Ok(VmLaunch {
-                root,
-                workspace: verifier.workspace.clone(),
-                shell: verifier.shell.clone(),
-                runtime_image: host.runtime_image.to_path_buf(),
-                vmm: host.vmm.to_path_buf(),
-                cpus: attempt.task().resources().cpus.clamp(1, u32::from(u8::MAX)),
-                memory_mib: attempt
-                    .task()
-                    .resources()
-                    .memory_mb
-                    .clamp(1, u64::from(u32::MAX)),
-                ext4: true,
-                resolver_configuration: agent.resolver_configuration.clone(),
-                environment: verifier.environment.clone(),
-                network_socket: agent.network_socket.clone(),
-                shared_directories: Vec::new(),
-            })
-        })
-        .transpose()
-}
-
-fn prepare_verifier_cache(
-    template: &Path,
-    task: &Task,
-) -> Result<Option<VerifierCache>, VmAttemptError> {
-    template
-        .is_file()
-        .then(|| VerifierCache::prepare(template, task, Path::new(DEFAULT_VM_CACHE)))
-        .transpose()
-        .map(Option::flatten)
-}
-
-fn spawn_attempt_network(
-    policy: NetworkPolicy,
-    gvproxy: Option<&Path>,
-    log: &Path,
-) -> Result<Option<Gvproxy>, VmAttemptError> {
-    match policy {
-        NetworkPolicy::Public => {
-            let binary = gvproxy.ok_or(VmAttemptError::NetworkBackendNotPrepared)?;
-            Gvproxy::spawn(binary, log).map(Some).map_err(Into::into)
-        }
-        NetworkPolicy::Disabled => Ok(None),
-    }
-}
-
-fn spawn_preparation_network(
-    policy: NetworkPolicy,
-    gvproxy: Option<&Path>,
-    log: &Path,
-) -> Result<Option<Gvproxy>, VmAttemptError> {
-    match policy {
-        NetworkPolicy::Public => {
-            let binary = gvproxy.ok_or(VmAttemptError::NetworkBackendNotPrepared)?;
-            Gvproxy::spawn_inherited(binary, log)
-                .map(Some)
-                .map_err(Into::into)
-        }
-        NetworkPolicy::Disabled => Ok(None),
-    }
-}
-
-impl VmLaunch {
-    fn spawn(
-        &self,
-        verifier_cache: Option<&AttemptVerifierCache>,
-        process_group: VmProcessGroup,
-    ) -> Result<VmToolSession, VmAttemptError> {
-        let mut command = Command::new(&self.vmm);
-        if process_group == VmProcessGroup::Isolated {
-            command.process_group(0);
-        }
-        let firmware = Path::new(DEFAULT_KRUNFW_DIRECTORY);
-        if firmware.join(KRUNFW_LIBRARY_FILENAME).is_file() {
-            command.env(KRUNFW_LIBRARY_PATH_ENVIRONMENT, firmware.canonicalize()?);
-        }
-        command.args(["eval", "vm", "run-config", "--config"]);
-
-        let network = if let Some(socket) = &self.network_socket {
-            Network::gvproxy(socket)
-        } else {
-            Network::Disabled
-        };
-        let mut vm = if self.ext4 {
-            VmConfig::ext4(&self.root)
-        } else {
-            VmConfig::new(&self.root)
-        }
-        .cpus(u8::try_from(self.cpus).unwrap_or(u8::MAX))
-        .memory_mib(u32::try_from(self.memory_mib).unwrap_or(u32::MAX))
-        .network(network);
-        for directory in &self.shared_directories {
-            vm = vm.shared_directory(directory.clone());
-        }
-        if self.ext4 {
-            vm = vm.block_device(BlockDevice::read_only(
-                GUEST_RUNTIME_BLOCK_ID,
-                &self.runtime_image,
-            ));
-            if let Some(cache) = verifier_cache {
-                vm = vm.block_device(BlockDevice::read_write(
-                    VERIFIER_CACHE_BLOCK_ID,
-                    &cache.disk,
-                ));
-            }
-        }
-
-        let mut guest = if self.ext4 {
-            GuestCommand::new("/bin/sh")
-                .arg("-c")
-                .arg(vm_guest_bootstrap_script(
-                    &self.workspace,
-                    &self.resolver_configuration,
-                ))
-        } else {
-            GuestCommand::new(EMBEDDED_GUEST_TOOL_RUNTIME).arg(&self.workspace)
-        };
-        for (name, value) in &self.environment {
-            guest = guest.env(name, value);
-        }
-        VmToolSession::spawn_vm(command, vm, guest).map_err(Into::into)
-    }
-}
-
-fn vm_guest_bootstrap_script(workspace: &str, resolver_configuration: &str) -> String {
-    let workspace = shell_word_without_double_quotes(workspace);
-    let resolver_configuration = shell_word_without_double_quotes(resolver_configuration);
-    format!(
-        "set -eu; rm -f /etc/resolv.conf; printf %b {resolver_configuration} > /etc/resolv.conf; \
-         mkdir -p -- {workspace} /logs/verifier {GUEST_RUNTIME_MOUNT}; \
-         mount -t ext4 -o ro {GUEST_RUNTIME_BLOCK_DEVICE} {GUEST_RUNTIME_MOUNT}; \
-         exec {BLOCK_GUEST_TOOL_RUNTIME} {workspace}"
-    )
-}
-
-fn shell_word_without_double_quotes(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len().saturating_add(2));
-    quoted.push('\'');
-    for character in value.chars() {
-        match character {
-            '\'' => quoted.push_str("'\\''"),
-            // libkrun cannot carry a literal double quote in an argv entry.
-            // Synthesize it only after the wrapper shell starts.
-            '"' => quoted.push_str("'$(printf '\\042')'"),
-            character => quoted.push(character),
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
-impl VerifierCache {
-    fn prepare(template: &Path, task: &Task, cache: &Path) -> Result<Option<Self>, VmAttemptError> {
-        let script = task.verifier_script_bytes()?;
-        let Some(setup) = recognized_verifier_setup(&script) else {
-            info!(
-                target: "nanocodex_eval",
-                task_name = task.name(),
-                verifier_cache_status = "unsupported",
-                "canonical verifier will use the cold dependency path"
-            );
-            return Ok(None);
-        };
-        let template_identity = template
-            .file_name()
-            .ok_or_else(|| io::Error::other("VM root disk template has no file name"))?;
-        let disk_bytes = task
-            .resources()
-            .storage_mb
-            .saturating_mul(1024 * 1024)
-            .clamp(
-                MINIMUM_VERIFIER_CACHE_DISK_BYTES,
-                MAXIMUM_VERIFIER_CACHE_DISK_BYTES,
-            );
-        let key = verifier_cache_key(
-            template_identity,
-            &script[setup.cacheable_start..setup.cacheable_end],
-            disk_bytes,
-        );
-        let root = cache.join("verifiers").join(&key);
-        let disk = root.join("cache.ext4");
-        let status = if disk.is_file() && verifier_cache_populated(&disk)? {
-            "hit"
-        } else {
-            "miss"
-        };
-        info!(
-            target: "nanocodex_eval",
-            task_name = task.name(),
-            verifier_cache_key = key,
-            verifier_cache_status = status,
-            verifier_cache_path = %root.display(),
-            "post-agent verifier dependency cache ready"
-        );
-        Ok(Some(Self {
-            root,
-            key,
-            status,
-            cacheable_start: setup.cacheable_start,
-            cacheable_end: setup.cacheable_end,
-            skip_setup: setup.skip_setup,
-            disk_bytes,
-        }))
-    }
-
-    fn materialize(
-        &self,
-        verifier_directory: &Path,
-    ) -> Result<AttemptVerifierCache, VmAttemptError> {
-        let disk = verifier_directory.join("cache.ext4");
-        let hit = self.is_ready()?;
-        if hit {
-            reflink_or_sparse_copy(&self.root.join("cache.ext4"), &disk)?;
-        } else {
-            format_verifier_cache_disk(&disk, self.disk_bytes)?;
-        }
-        Ok(AttemptVerifierCache {
-            disk,
-            skip_setup: hit && self.skip_setup,
-        })
-    }
-
-    fn is_ready(&self) -> io::Result<bool> {
-        let disk = self.root.join("cache.ext4");
-        Ok(disk.is_file() && verifier_cache_populated(&disk)?)
-    }
-
-    async fn prepare_once(
-        &self,
-        task: &Task,
-        environment: &VmEnvironment,
-        vmm: &Path,
-        runtime_image: &Path,
-        gvproxy: Option<&Path>,
-    ) -> Result<(), VmAttemptError> {
-        if self.is_ready()? {
-            return Ok(());
-        }
-        fs::create_dir_all(&self.root)?;
-        let lock_path = self.root.join(".prepare.lock");
-        let lock = tokio::task::spawn_blocking(move || {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(lock_path)?;
-            file.lock_exclusive()?;
-            Ok::<_, io::Error>(file)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        if self.is_ready()? {
-            info!(
-                target: "nanocodex_eval",
-                verifier_cache_key = self.key,
-                "verifier cache preparation reused another process's result"
-            );
-            drop(lock);
-            return Ok(());
-        }
-        let target = self.root.join("cache.ext4");
-        if target.is_file() {
-            fs::remove_file(&target)?;
-        }
-        self.populate(task, environment, vmm, runtime_image, gvproxy)
-            .await?;
-        drop(lock);
-        Ok(())
-    }
-
-    async fn populate(
-        &self,
-        task: &Task,
-        environment: &VmEnvironment,
-        vmm: &Path,
-        runtime_image: &Path,
-        gvproxy: Option<&Path>,
-    ) -> Result<(), VmAttemptError> {
-        let temporary = tempfile::tempdir_in(&self.root)?;
-        let root = materialize_attempt_root(&environment.rootfs, runtime_image, temporary.path())?;
-        let network = spawn_preparation_network(
-            task.network(),
-            gvproxy,
-            &temporary.path().join("gvproxy.log"),
-        )?;
-        let launch = VmLaunch {
-            root,
-            workspace: environment.workspace.clone(),
-            shell: environment.shell.clone(),
-            runtime_image: runtime_image.to_path_buf(),
-            vmm: vmm.to_path_buf(),
-            cpus: task.resources().cpus.clamp(1, u32::from(u8::MAX)),
-            memory_mib: task.resources().memory_mb.clamp(1, u64::from(u32::MAX)),
-            ext4: true,
-            resolver_configuration: network
-                .as_ref()
-                .map_or_else(String::new, |_| GUEST_PUBLIC_RESOLV_CONF.to_owned()),
-            environment: environment.environment.clone(),
-            network_socket: network
-                .as_ref()
-                .map(|network| network.socket().to_path_buf()),
-            shared_directories: Vec::new(),
-        };
-        let verifier_directory = temporary.path().join("verifier");
-        fs::create_dir_all(&verifier_directory)?;
-        let attempt_cache = AttemptVerifierCache {
-            disk: verifier_directory.join("cache.ext4"),
-            skip_setup: false,
-        };
-        format_verifier_cache_disk(&attempt_cache.disk, self.disk_bytes)?;
-        let session = launch.spawn(Some(&attempt_cache), VmProcessGroup::Inherited)?;
-        mount_verifier_cache(&session).await?;
-        let script = task.verifier_script_bytes()?;
-        session
-            .write_file(
-                VERIFIER_CACHE_PREPARE_SCRIPT,
-                script[self.cacheable_start..self.cacheable_end].to_vec(),
-                0o700,
-            )
-            .await?;
-        let mut last_output = None;
-        for retry in 0..=VERIFIER_NETWORK_RETRIES {
-            restore_verifier_resolver(&session, &launch).await?;
-            let output = session
-                .command(
-                    VmCommand::new(&launch.shell)
-                        .arg(VERIFIER_CACHE_PREPARE_SCRIPT)
-                        .current_directory(&launch.workspace)
-                        .environment(base_guest_environment(task, &launch.workspace))
-                        .timeout(task.verifier().timeout()),
-                )
-                .await?;
-            let retryable = verifier_bootstrap_network_failed(&output);
-            let succeeded = output.exit_code == 0;
-            last_output = Some(output);
-            if succeeded || retry == VERIFIER_NETWORK_RETRIES || !retryable {
-                break;
-            }
-            let delay = verifier_network_retry_delay(retry);
-            warn!(
-                target: "nanocodex_eval",
-                verifier_cache_key = self.key,
-                retry = retry + 1,
-                max_retries = VERIFIER_NETWORK_RETRIES,
-                retry_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                "verifier cache preparation hit a transient network failure; retrying"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        let output =
-            last_output.ok_or_else(|| io::Error::other("verifier cache setup did not execute"))?;
-        let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
-        fs::write(self.root.join("prepare.log"), &combined)?;
-        session.shutdown().await?;
-        if output.exit_code != 0 || !verifier_cache_populated(&attempt_cache.disk)? {
-            return Err(io::Error::other(format!(
-                "verifier cache setup exited {}: {}",
-                output.exit_code,
-                String::from_utf8_lossy(&combined)
-            ))
-            .into());
-        }
-        if !self.mark_ready(&attempt_cache)? {
-            return Err(io::Error::other("verifier cache setup produced no reusable cache").into());
-        }
-        info!(
-            target: "nanocodex_eval",
-            verifier_cache_key = self.key,
-            "verifier cache prepared before agent execution"
-        );
-        Ok(())
-    }
-
-    fn mark_ready(&self, attempt: &AttemptVerifierCache) -> io::Result<bool> {
-        if attempt.skip_setup || !verifier_cache_populated(&attempt.disk)? {
-            return Ok(false);
-        }
-        fs::create_dir_all(&self.root)?;
-        let target = self.root.join("cache.ext4");
-        let mut identity = Sha256::new();
-        identity.update(attempt.disk.as_os_str().as_encoded_bytes());
-        let temporary = self
-            .root
-            .join(format!("cache.{}.tmp", hex::encode(identity.finalize())));
-        reflink_or_sparse_copy(&attempt.disk, &temporary)?;
-        match fs::hard_link(&temporary, &target) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                fs::remove_file(&temporary)?;
-                return Err(error);
-            }
-        }
-        fs::remove_file(temporary)?;
-        Ok(true)
-    }
-}
-
-fn verifier_cache_key(
-    template_identity: &OsStr,
-    cacheable_script: &[u8],
-    disk_bytes: u64,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(VERIFIER_CACHE_VERSION.to_le_bytes());
-    digest.update(VM_GUEST_TARGET.as_bytes());
-    digest.update(template_identity.as_encoded_bytes());
-    digest.update(cacheable_script);
-    digest.update(disk_bytes.to_le_bytes());
-    hex::encode(digest.finalize())
-}
-
-fn format_verifier_cache_disk(path: &Path, disk_bytes: u64) -> Result<(), VmAttemptError> {
-    let mut formatter = Formatter::new(path, 4_096, disk_bytes)?;
-    for directory in ["apt-archives", "apt-lists", "uv-cache", "uv-home"] {
-        formatter.create(
-            &format!("/{directory}"),
-            make_mode(file_mode::S_IFDIR, 0o755),
-            None,
-            None,
-            None,
-            Some(0),
-            Some(0),
-            None,
-        )?;
-    }
-    formatter.close()?;
-    Ok(())
-}
-
-fn verifier_cache_populated(disk: &Path) -> io::Result<bool> {
-    let mut reader = Reader::new(disk).map_err(io::Error::other)?;
-    Ok(reader.exists("/uv-home/bin/env") && reader.exists("/uv-home/bin/uv"))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RecognizedVerifierSetup {
-    cacheable_start: usize,
-    cacheable_end: usize,
-    skip_setup: bool,
-}
-
-fn recognized_verifier_setup(script: &[u8]) -> Option<RecognizedVerifierSetup> {
-    let script = std::str::from_utf8(script).ok()?;
-    let marker = script.find(VERIFIER_SETUP_MARKER)?;
-    let setup = &script[..marker];
-    let commands = setup
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect::<Vec<_>>();
-    let canonical = [
-        "apt-get update",
-        "apt-get install -y curl",
-        "curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh",
-        "source $HOME/.local/bin/env",
-    ];
-    let has_pinned_uv_bootstrap = commands
-        .windows(2)
-        .any(|commands| commands == &canonical[2..]);
-    if !has_pinned_uv_bootstrap {
-        return None;
-    }
-    let cacheable_start = script
-        .strip_prefix("#!")
-        .and_then(|script| script.find('\n'))
-        .map_or(0, |offset| offset + 3);
-    Some(RecognizedVerifierSetup {
-        cacheable_start,
-        cacheable_end: marker,
-        skip_setup: commands == canonical,
-    })
-}
-
-fn cached_verifier_script(script: &[u8], setup: RecognizedVerifierSetup) -> Vec<u8> {
-    let mut cached = Vec::with_capacity(script.len());
-    cached.extend_from_slice(&script[..setup.cacheable_start]);
-    cached.extend_from_slice(b"\nsource /root/.local/bin/env\n");
-    cached.extend_from_slice(&script[setup.cacheable_end..]);
-    cached
-}
-
-fn verifier_bootstrap_network_failed(output: &VmCommandOutput) -> bool {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let contains = |needle: &str| stdout.contains(needle) || stderr.contains(needle);
-    let dependency_runner_missing = contains("uvx: command not found")
-        || contains("/root/.local/bin/env: No such file or directory");
-    let dns_failed = contains("Temporary failure resolving") || contains("Could not resolve host");
-    let network_failed = dns_failed
-        || contains("failed to download https://github.com/astral-sh/uv/")
-        || contains("The requested URL returned error: 502")
-        || contains("The requested URL returned error: 503")
-        || contains("The requested URL returned error: 504");
-    let apt_bootstrap_failed = dns_failed
-        && (contains("deb.debian.org")
-            || contains("archive.ubuntu.com")
-            || contains("security.ubuntu.com"));
-    apt_bootstrap_failed || dependency_runner_missing && network_failed
-}
-
-impl AttemptVerifier for VmVerifier {
-    fn verify<'a>(
-        &'a mut self,
-        task: &'a Task,
-        attempt: EvalAttempt<'a>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<AttemptVerification, AttemptVerificationFailure>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move { self.verify_inner(task, attempt).await })
-    }
-
-    fn shutdown(&mut self) -> Pin<Box<dyn Future<Output = CleanupPhase> + Send + '_>> {
-        Box::pin(async move { self.shutdown_before_verification().await })
-    }
-}
-
-impl VmVerifier {
-    async fn collect_artifacts(
-        session: &VmToolSession,
-        task: &Task,
-        launch: &VmLaunch,
-    ) -> Result<Option<Vec<u8>>, VmAttemptError> {
-        for collect in task.verifier().collect() {
-            let output = session
-                .command(
-                    VmCommand::new("/bin/sh")
-                        .arg("-c")
-                        .arg(collect.command())
-                        .current_directory(&launch.workspace)
-                        .environment(base_guest_environment(task, &launch.workspace))
-                        .timeout(task.verifier().timeout()),
-                )
-                .await?;
-            if output.exit_code != 0 {
-                return Err(io::Error::other(format!(
-                    "verifier artifact collection exited {}: {}",
-                    output.exit_code,
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-                .into());
-            }
-        }
-        if task.artifacts().is_empty() {
-            return Ok(None);
-        }
-
-        let mut command = VmCommand::new("/bin/tar")
-            .arg("-C")
-            .arg("/")
-            .arg("-cf")
-            .arg("/tmp/nanoeval-artifacts.tar")
-            .arg("--");
-        for artifact in task.artifacts() {
-            let relative = artifact.strip_prefix("/").map_err(|_| {
-                io::Error::other(format!(
-                    "artifact path must be absolute: {}",
-                    artifact.display()
-                ))
-            })?;
-            if relative.as_os_str().is_empty()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                return Err(io::Error::other(format!(
-                    "artifact path is not a safe guest path: {}",
-                    artifact.display()
-                ))
-                .into());
-            }
-            command = command.arg(
-                relative
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::other(format!(
-                            "artifact path is not UTF-8: {}",
-                            artifact.display()
-                        ))
-                    })?
-                    .to_owned(),
-            );
-        }
-        let output = session
-            .command(command.timeout(task.verifier().timeout()))
-            .await?;
-        if output.exit_code != 0 {
-            return Err(io::Error::other(format!(
-                "artifact archive exited {}: {}",
-                output.exit_code,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-            .into());
-        }
-        session
-            .read_file("/tmp/nanoeval-artifacts.tar")
-            .await
-            .map(Some)
-            .map_err(Into::into)
-    }
-
-    async fn stage_artifacts(
-        session: &VmToolSession,
-        artifacts: Option<Vec<u8>>,
-    ) -> Result<(), VmAttemptError> {
-        let Some(artifacts) = artifacts else {
-            return Ok(());
-        };
-        session
-            .write_file("/tmp/nanoeval-artifacts.tar", artifacts, 0o600)
-            .await?;
-        let output = session
-            .command(
-                VmCommand::new("/bin/tar")
-                    .arg("-C")
-                    .arg("/")
-                    .arg("-xf")
-                    .arg("/tmp/nanoeval-artifacts.tar")
-                    .timeout(Duration::from_mins(10)),
-            )
-            .await?;
-        if output.exit_code != 0 {
-            return Err(io::Error::other(format!(
-                "artifact extraction exited {}: {}",
-                output.exit_code,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-            .into());
-        }
-        Ok(())
-    }
-
-    async fn verify_inner(
-        &mut self,
-        task: &Task,
-        attempt: EvalAttempt<'_>,
-    ) -> Result<AttemptVerification, AttemptVerificationFailure> {
-        if let Err(error) = task.validate_package() {
-            let occurred_at = Utc::now();
-            let cleanup = self.shutdown_before_verification().await;
-            return Err(AttemptVerificationFailure::observed_at(
-                error,
-                occurred_at,
-                cleanup,
-            ));
-        }
-        let verifier_directory = attempt.directory().join("verifier");
-        if let Err(error) = fs::create_dir_all(&verifier_directory) {
-            let occurred_at = Utc::now();
-            let cleanup = self.shutdown_before_verification().await;
-            return Err(AttemptVerificationFailure::observed_at(
-                error,
-                occurred_at,
-                cleanup,
-            ));
-        }
-        let (verifier_launch, verifier_session) = self.start_verifier_session(task).await?;
-        let verification = async {
-            let command =
-                self.verifier_command(task, &verifier_launch, self.attempt_cache.as_ref())?;
-            let (output, verifier_timed_out) = self
-                .execute_verifier_with_network_retries(&verifier_session, &verifier_launch, command)
-                .await?;
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let combined = match (stdout.is_empty(), stderr.is_empty()) {
-                (_, true) => stdout.clone(),
-                (true, false) => stderr.clone(),
-                (false, false) => format!("{stdout}\n{stderr}"),
-            };
-            fs::write(verifier_directory.join("test-stdout.txt"), combined)?;
-            let reward_bytes = if verifier_timed_out {
-                b"0\n".to_vec()
-            } else {
-                verifier_session
-                    .read_file("/logs/verifier/reward.txt")
-                    .await?
-            };
-            fs::write(verifier_directory.join("reward.txt"), &reward_bytes)?;
-            if let Ok(ctrf) = verifier_session.read_file("/logs/verifier/ctrf.json").await {
-                fs::write(verifier_directory.join("ctrf.json"), ctrf)?;
-            }
-            let answer_path = format!("{}/answer.txt", verifier_launch.workspace);
-            if let Ok(answer) = verifier_session.read_file(answer_path).await {
-                fs::write(attempt.workspace().join("answer.txt"), answer)?;
-            }
-            let reward = String::from_utf8_lossy(&reward_bytes)
-                .trim()
-                .parse::<f64>()?;
-            task.validate_package()?;
-            Ok::<_, VmAttemptError>((output, stdout, stderr, reward))
-        }
-        .await;
-        let verification_error_at = verification.as_ref().err().map(|_| Utc::now());
-        let cleanup_started = Utc::now();
-        let shutdown = verifier_session.shutdown().await;
-        let (output, stdout, stderr, reward) = match verification {
-            Ok(verification) => verification,
-            Err(primary) => {
-                let cleanup = self.cleanup_after_shutdown(cleanup_started, shutdown, false);
-                return Err(AttemptVerificationFailure::observed_at(
-                    primary,
-                    verification_error_at.unwrap_or(cleanup_started),
-                    cleanup,
-                ));
-            }
-        };
-        let cleanup = match shutdown {
-            Ok(()) => {
-                let cache_cleanup = self.finish_verifier_cache();
-                let disk_cleanup = if reward > 0.0 && !self.retain_passed_rootfs {
-                    self.remove_passed_root_disks()
-                } else {
-                    Ok(())
-                };
-                match cache_cleanup.and(disk_cleanup) {
-                    Ok(()) => CleanupPhase::completed(cleanup_started),
-                    Err(error) => CleanupPhase::failed(cleanup_started, &error),
-                }
-            }
-            Err(error) => {
-                if let Err(cache_error) = self.try_remove_attempt_cache() {
-                    warn!(
-                        target: "nanocodex_eval",
-                        error = %cache_error,
-                        primary_error = %error,
-                        "verifier cache cleanup also failed after VM shutdown failure"
-                    );
-                }
-                CleanupPhase::failed(cleanup_started, &error)
-            }
-        };
-        Ok(AttemptVerification {
-            result: VerifierResult {
-                exit_code: output.exit_code,
-                rewards: BTreeMap::from([("reward".to_owned(), reward)]),
-            },
-            stdout,
-            stderr,
-            cleanup,
-        })
-    }
-
-    async fn start_verifier_session(
-        &mut self,
-        task: &Task,
-    ) -> Result<(VmLaunch, VmToolSession), AttemptVerificationFailure> {
-        let Some(agent_session) = self.agent_session.take() else {
-            return Err(AttemptVerificationFailure::new(
-                VmAttemptError::AgentSessionAlreadyFinished,
-                CleanupPhase::not_required(),
-            ));
-        };
-        let launch = self
-            .separate_launch
-            .clone()
-            .unwrap_or_else(|| self.launch.clone());
-        let session = if self.separate_launch.is_some() {
-            let artifacts = match Self::collect_artifacts(&agent_session, task, &self.launch).await
-            {
-                Ok(artifacts) => artifacts,
-                Err(primary) => {
-                    let occurred_at = Utc::now();
-                    let cleanup = self.cleanup_session(Some(&agent_session)).await;
-                    return Err(AttemptVerificationFailure::observed_at(
-                        primary,
-                        occurred_at,
-                        cleanup,
-                    ));
-                }
-            };
-            let cleanup_started = Utc::now();
-            if let Err(primary) = agent_session.shutdown().await {
-                let occurred_at = Utc::now();
-                if let Err(cache_error) = self.try_remove_attempt_cache() {
-                    warn!(
-                        target: "nanocodex_eval",
-                        error = %cache_error,
-                        primary_error = %primary,
-                        "verifier cache cleanup also failed after VM shutdown failure"
-                    );
-                }
-                let cleanup = CleanupPhase::failed(cleanup_started, &primary);
-                return Err(AttemptVerificationFailure::observed_at(
-                    primary,
-                    occurred_at,
-                    cleanup,
-                ));
-            }
-            let session = match launch.spawn(None, VmProcessGroup::Isolated) {
-                Ok(session) => session,
-                Err(primary) => {
-                    let occurred_at = Utc::now();
-                    let cleanup = self.cleanup_after_shutdown(cleanup_started, Ok(()), false);
-                    return Err(AttemptVerificationFailure::observed_at(
-                        primary,
-                        occurred_at,
-                        cleanup,
-                    ));
-                }
-            };
-            if let Err(primary) = Self::stage_artifacts(&session, artifacts).await {
-                let occurred_at = Utc::now();
-                let cleanup = self.cleanup_session(Some(&session)).await;
-                return Err(AttemptVerificationFailure::observed_at(
-                    primary,
-                    occurred_at,
-                    cleanup,
-                ));
-            }
-            session
-        } else {
-            let setup = async {
-                let tests = tempfile::tempdir()?;
-                task.materialize_verifier_files(tests.path())?;
-                Self::copy_directory(
-                    &agent_session,
-                    tests.path(),
-                    tests.path(),
-                    Path::new("/tests"),
-                )
-                .await
-            }
-            .await;
-            if let Err(primary) = setup {
-                let occurred_at = Utc::now();
-                let cleanup = self.cleanup_session(Some(&agent_session)).await;
-                return Err(AttemptVerificationFailure::observed_at(
-                    primary,
-                    occurred_at,
-                    cleanup,
-                ));
-            }
-            agent_session
-        };
-        let setup = async {
-            session
-                .write_file("/logs/verifier/.nanoeval", Vec::new(), 0o600)
-                .await?;
-            if self.attempt_cache.is_some() {
-                self.mount_verifier_cache(&session).await?;
-            }
-            self.stage_cached_verifier(&session, task).await
-        }
-        .await;
-        if let Err(primary) = setup {
-            let occurred_at = Utc::now();
-            let cleanup = self.cleanup_session(Some(&session)).await;
-            return Err(AttemptVerificationFailure::observed_at(
-                primary,
-                occurred_at,
-                cleanup,
-            ));
-        }
-        Ok((launch, session))
-    }
-
-    async fn shutdown_before_verification(&mut self) -> CleanupPhase {
-        let session = self.agent_session.take();
-        self.cleanup_session(session.as_ref()).await
-    }
-
-    async fn cleanup_session(&mut self, session: Option<&VmToolSession>) -> CleanupPhase {
-        if session.is_none() && self.attempt_cache.is_none() {
-            return CleanupPhase::not_required();
-        }
-        let cleanup_started = Utc::now();
-        let shutdown = match session {
-            Some(session) => session.shutdown().await,
-            None => Ok(()),
-        };
-        self.cleanup_after_shutdown(cleanup_started, shutdown, false)
-    }
-
-    fn cleanup_after_shutdown(
-        &mut self,
-        cleanup_started: DateTime<Utc>,
-        shutdown: Result<(), VmToolSessionError>,
-        commit_cache: bool,
-    ) -> CleanupPhase {
-        let cache_cleanup = if commit_cache {
-            self.finish_verifier_cache()
-        } else {
-            self.try_remove_attempt_cache()
-        };
-        match (shutdown, cache_cleanup) {
-            (Ok(()), Ok(())) => CleanupPhase::completed(cleanup_started),
-            (Err(primary), secondary) => {
-                if let Err(secondary) = secondary {
-                    warn!(
-                        target: "nanocodex_eval",
-                        error = %secondary,
-                        primary_error = %primary,
-                        "verifier cache cleanup also failed after VM shutdown failure"
-                    );
-                }
-                CleanupPhase::failed(cleanup_started, &primary)
-            }
-            (Ok(()), Err(error)) => CleanupPhase::failed(cleanup_started, &error),
-        }
-    }
-
-    fn finish_verifier_cache(&mut self) -> Result<(), VmAttemptError> {
-        if let (Some(cache), Some(attempt_cache)) = (&self.cache, &self.attempt_cache)
-            && !attempt_cache.skip_setup
-        {
-            if cache.mark_ready(attempt_cache)? {
-                info!(
-                    target: "nanocodex_eval",
-                    verifier_cache_key = cache.key,
-                    verifier_cache_previous_status = cache.status,
-                    "post-agent verifier dependency cache committed"
-                );
-            } else {
-                warn!(
-                    target: "nanocodex_eval",
-                    verifier_cache_key = cache.key,
-                    "verifier dependency cache remained incomplete"
-                );
-            }
-        }
-        if let Some(attempt_cache) = self.attempt_cache.take() {
-            fs::remove_file(attempt_cache.disk)?;
-        }
-        Ok(())
-    }
-
-    fn try_remove_attempt_cache(&mut self) -> Result<(), VmAttemptError> {
-        let Some(attempt_cache) = self.attempt_cache.take() else {
-            return Ok(());
-        };
-        match fs::remove_file(&attempt_cache.disk) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn remove_attempt_cache(&mut self) {
-        if let Err(error) = self.try_remove_attempt_cache() {
-            warn!(
-                target: "nanocodex_eval",
-                %error,
-                "failed to remove disposable attempt verifier cache"
-            );
-        }
-    }
-
-    fn remove_passed_root_disks(&self) -> Result<(), VmAttemptError> {
-        let mut failures = Vec::new();
-        for launch in std::iter::once(&self.launch).chain(self.separate_launch.as_ref()) {
-            if !launch.ext4 {
-                continue;
-            }
-            match remove_passed_rootfs(&launch.root) {
-                Ok(true) => info!(
-                    target: "nanocodex_eval",
-                    vm_rootfs_path = %launch.root.display(),
-                    "removed passed attempt VM root disk"
-                ),
-                Ok(false) => {}
-                Err(error) => {
-                    warn!(
-                        target: "nanocodex_eval",
-                        vm_rootfs_path = %launch.root.display(),
-                        %error,
-                        "failed to remove passed attempt VM root disk"
-                    );
-                    failures.push(format!("{}: {error}", launch.root.display()));
-                }
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "failed to remove passed attempt VM root disks: {}",
-                failures.join("; ")
-            ))
-            .into())
-        }
-    }
-
-    async fn execute_verifier_command(
-        session: &VmToolSession,
-        command: VmCommand,
-    ) -> Result<(VmCommandOutput, bool), VmAttemptError> {
-        match session.command(command).await {
-            Ok(output) => Ok((output, false)),
-            Err(VmToolSessionError::GuestTimeout { timeout, output }) => {
-                Ok((verifier_timeout_output(timeout, output), true))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn execute_verifier_with_network_retries(
-        &self,
-        session: &VmToolSession,
-        launch: &VmLaunch,
-        command: VmCommand,
-    ) -> Result<(VmCommandOutput, bool), VmAttemptError> {
-        for retry in 0..=VERIFIER_NETWORK_RETRIES {
-            restore_verifier_resolver(session, launch).await?;
-            let result = Self::execute_verifier_command(session, command.clone()).await?;
-            if result.1
-                || retry == VERIFIER_NETWORK_RETRIES
-                || !verifier_bootstrap_network_failed(&result.0)
-            {
-                return Ok(result);
-            }
-            let delay = verifier_network_retry_delay(retry);
-            warn!(
-                target: "nanocodex_eval",
-                retry = retry + 1,
-                max_retries = VERIFIER_NETWORK_RETRIES,
-                retry_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                "canonical verifier dependency bootstrap hit a transient network failure; retrying"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        unreachable!("the verifier retry loop always returns")
-    }
-
-    async fn stage_cached_verifier(
-        &self,
-        session: &VmToolSession,
-        task: &Task,
-    ) -> Result<(), VmAttemptError> {
-        if !self
-            .attempt_cache
-            .as_ref()
-            .is_some_and(|cache| cache.skip_setup)
-        {
-            return Ok(());
-        }
-        let cache = self
-            .cache
-            .as_ref()
-            .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
-        let script = task.verifier_script_bytes()?;
-        let cached = cached_verifier_script(
-            &script,
-            RecognizedVerifierSetup {
-                cacheable_start: cache.cacheable_start,
-                cacheable_end: cache.cacheable_end,
-                skip_setup: cache.skip_setup,
-            },
-        );
-        session
-            .write_file(CACHED_VERIFIER_SCRIPT, cached, 0o700)
-            .await?;
-        Ok(())
-    }
-
-    async fn mount_verifier_cache(&self, session: &VmToolSession) -> Result<(), VmAttemptError> {
-        mount_verifier_cache(session).await
-    }
-
-    fn verifier_command(
-        &self,
-        task: &Task,
-        launch: &VmLaunch,
-        attempt_cache: Option<&AttemptVerifierCache>,
-    ) -> Result<VmCommand, VmAttemptError> {
-        let skip_setup = attempt_cache.is_some_and(|cache| cache.skip_setup);
-        let mut command = if skip_setup {
-            let cache = self
-                .cache
-                .as_ref()
-                .ok_or_else(|| io::Error::other("verifier cache metadata is missing"))?;
-            info!(
-                target: "nanocodex_eval",
-                verifier_cache_key = cache.key,
-                verifier_setup_bytes_skipped = cache.cacheable_end - cache.cacheable_start,
-                verifier_system_setup_bytes = cache.cacheable_start,
-                "running canonical verifier with only persisted setup omitted"
-            );
-            VmCommand::new(verifier_shell(&launch.shell, skip_setup)).arg(CACHED_VERIFIER_SCRIPT)
-        } else {
-            VmCommand::new(verifier_shell(&launch.shell, skip_setup)).arg("/tests/test.sh")
-        };
-        command = command
-            .current_directory(&launch.workspace)
-            .environment(base_guest_environment(task, &launch.workspace))
-            .timeout(task.verifier().timeout());
-        Ok(command)
-    }
-
-    fn copy_directory<'a>(
-        session: &'a VmToolSession,
-        root: &'a Path,
-        directory: &'a Path,
-        destination: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<(), VmAttemptError>> + Send + 'a>> {
-        Box::pin(async move {
-            let relative = directory.strip_prefix(root).map_err(io::Error::other)?;
-            let guest_directory = destination.join(relative).to_string_lossy().into_owned();
-            let directory_mode =
-                std::os::unix::fs::PermissionsExt::mode(&fs::metadata(directory)?.permissions())
-                    & 0o7777;
-            session
-                .create_directory(&guest_directory, 0o700, None)
-                .await?;
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                let path = entry.path();
-                let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-                let guest = destination.join(relative).to_string_lossy().into_owned();
-                let file_type = entry.file_type()?;
-                if file_type.is_dir() {
-                    Self::copy_directory(session, root, &path, destination).await?;
-                } else if file_type.is_file() {
-                    let mode =
-                        std::os::unix::fs::PermissionsExt::mode(&entry.metadata()?.permissions())
-                            & 0o7777;
-                    session
-                        .write_file_with_mtime(guest.as_str(), fs::read(path)?, mode, 0)
-                        .await?;
-                } else {
-                    return Err(VmAttemptError::Collision(path));
-                }
-            }
-            session
-                .create_directory(&guest_directory, directory_mode, Some(0))
-                .await?;
-            Ok(())
-        })
-    }
-}
-
-impl Drop for VmVerifier {
-    fn drop(&mut self) {
-        self.remove_attempt_cache();
-    }
-}
-
-const fn verifier_network_retry_delay(retry: usize) -> Duration {
-    let exponent = if retry > 8 { 8 } else { retry };
-    VERIFIER_NETWORK_RETRY_BASE_DELAY.saturating_mul(1_u32 << exponent)
-}
-
-async fn restore_verifier_resolver(
-    session: &VmToolSession,
-    launch: &VmLaunch,
-) -> Result<(), VmAttemptError> {
-    if launch.resolver_configuration.is_empty() {
-        return Ok(());
-    }
-    let output = session
-        .command(
-            VmCommand::new("/bin/sh")
-                .arg("-c")
-                .arg(format!(
-                    "rm -f /etc/resolv.conf && printf '{}' > /etc/resolv.conf",
-                    launch.resolver_configuration
-                ))
-                .timeout(Duration::from_secs(10)),
-        )
-        .await?;
-    if output.exit_code != 0 {
-        return Err(io::Error::other(format!(
-            "restoring verifier DNS configuration exited {}: {}",
-            output.exit_code,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-async fn mount_verifier_cache(session: &VmToolSession) -> Result<(), VmAttemptError> {
-    let output = session
-        .command(
-            VmCommand::new("/bin/sh")
-                .arg("-c")
-                .arg(format!(
-                    "mkdir -p {VERIFIER_CACHE_MOUNT} /var/cache/apt/archives /var/lib/apt/lists /root/.cache/uv /root/.local && mount -t ext4 {VERIFIER_CACHE_BLOCK_DEVICE} {VERIFIER_CACHE_MOUNT} && mount --bind {VERIFIER_CACHE_MOUNT}/apt-archives /var/cache/apt/archives && mount --bind {VERIFIER_CACHE_MOUNT}/apt-lists /var/lib/apt/lists && mount --bind {VERIFIER_CACHE_MOUNT}/uv-cache /root/.cache/uv && mount --bind {VERIFIER_CACHE_MOUNT}/uv-home /root/.local"
-                ))
-                .timeout(Duration::from_secs(30)),
-        )
-        .await?;
-    if output.exit_code != 0 {
-        return Err(io::Error::other(format!(
-            "mounting verifier cache exited {}: {}",
-            output.exit_code,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-        .into());
-    }
-    Ok(())
-}
-
-fn remove_passed_rootfs(rootfs: &Path) -> io::Result<bool> {
-    if !rootfs.is_file() {
-        return Ok(false);
-    }
-    fs::remove_file(rootfs)?;
-    Ok(true)
-}
-
-fn verifier_timeout_output(
-    timeout: Duration,
-    mut output: VmCommandPartialOutput,
-) -> VmCommandOutput {
-    output.stderr.extend_from_slice(
-        format!(
-            "\ncanonical verifier exceeded its {timeout:?} deadline; \
-             the candidate is scored with reward 0\n"
-        )
-        .as_bytes(),
-    );
-    VmCommandOutput {
-        exit_code: 124,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    }
-}
-
-const fn verifier_shell(configured: &str, skip_setup: bool) -> &str {
-    if skip_setup { "/bin/bash" } else { configured }
-}
-
-fn base_guest_environment(task: &Task, workspace: &str) -> Vec<(String, String)> {
-    let mut environment = BTreeMap::from([
-        (
-            "PATH".to_owned(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-        ),
-        ("HOME".to_owned(), "/root".to_owned()),
-        ("NANOCODEX_EVAL_WORKSPACE".to_owned(), workspace.to_owned()),
-        (
-            "NANOCODEX_EVAL_VERIFIER_LOGS".to_owned(),
-            "/logs/verifier".to_owned(),
-        ),
-        // Retained tasks from the temporary Nanoeval repository still
-        // consume these names.
-        ("NANOEVAL_WORKSPACE".to_owned(), workspace.to_owned()),
-        (
-            "NANOEVAL_VERIFIER_LOGS".to_owned(),
-            "/logs/verifier".to_owned(),
-        ),
-    ]);
-    environment.extend(task.environment().clone());
-    environment.extend(task.verifier().environment().clone());
-    environment.into_iter().collect()
-}
-
-fn record_operation<T, E>(span: &tracing::Span, started_at: Instant, result: &Result<T, E>)
-where
-    E: std::fmt::Display,
-{
-    let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    span.record("duration_ns", duration_ns);
-    match result {
-        Ok(_) => {
-            span.record("status", "completed");
-            span.record("otel.status_code", "OK");
-            span.in_scope(|| {
-                info!(
-                    target: "nanocodex_eval",
-                    duration_ns,
-                    status = "completed",
-                    "VM attempt operation completed"
-                );
-            });
-        }
-        Err(error) => {
-            span.record("status", "failed");
-            span.record("otel.status_code", "ERROR");
-            span.record("error.message", tracing::field::display(error));
-            span.in_scope(|| {
-                info!(
-                    target: "nanocodex_eval",
-                    duration_ns,
-                    status = "failed",
-                    error = %error,
-                    "VM attempt operation failed"
-                );
-            });
-        }
-    }
-}
-
-fn materialize_rootfs(source: &Path, destination: &Path) -> Result<(), VmAttemptError> {
-    if !source.is_dir() {
-        return Err(VmAttemptError::InvalidRootfs(source.to_path_buf()));
-    }
-    copy_root_entries(source, destination, true)
-}
-
-fn copy_root_entries(source: &Path, destination: &Path, root: bool) -> Result<(), VmAttemptError> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        if root && matches!(entry.file_name().to_str(), Some("workspace" | "verifier")) {
-            continue;
-        }
-        let source = entry.path();
-        let target = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source)?;
-        if metadata.file_type().is_symlink() {
-            if target.exists() || fs::symlink_metadata(&target).is_ok() {
-                return Err(VmAttemptError::Collision(target));
-            }
-            std::os::unix::fs::symlink(fs::read_link(source)?, target)?;
-        } else if metadata.is_dir() {
-            if target.exists() && !target.is_dir() {
-                return Err(VmAttemptError::Collision(target));
-            }
-            fs::create_dir_all(&target)?;
-            copy_root_entries(&source, &target, false)?;
-        } else if metadata.is_file() {
-            if target.exists() {
-                return Err(VmAttemptError::Collision(target));
-            }
-            fs::copy(source, target)?;
-        } else {
-            return Err(VmAttemptError::Collision(source));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct RunReport {
     job_id: uuid::Uuid,
@@ -5975,8 +4120,7 @@ mod tests {
         os::unix::fs::PermissionsExt as _,
         path::{Path, PathBuf},
         pin::Pin,
-        process::Command as StdCommand,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use chrono::Utc;
@@ -5988,26 +4132,20 @@ mod tests {
         BillingCompleteness, CleanupPhase, CleanupStatus, EvalAttempt, EvalOutcome, Evaluator,
         Sweep, Task, VerifierResult,
     };
-    use nanocodex_vm::tools::{
-        VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
-    };
-    use nix::unistd::getpgrp;
+    use nanocodex_vm::tools::{VmToolSession, VmToolSessionError};
     use serde_json::json;
     use sha2::Digest as _;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::{
-        CACHED_VERIFIER_SCRIPT, DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS,
-        DIFF_CODEX_CA_BUNDLE_FILENAME, DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME,
-        DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT, DiffCodexCaSource, EvalInterruptError, HostResources,
-        InterruptListener, RetainedBuild, RetainedScheduling, Run, RunInvocation, RunMeasurements,
-        RunSummary, VmLaunch, VmProcessGroup, VmRetention, VmVerifier, cached_verifier_script,
+        DEFAULT_HOST_UTILIZATION_PERCENT, DEFAULT_TRIALS, DIFF_CODEX_CA_BUNDLE_FILENAME,
+        DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME, DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
+        DiffCodexCaSource, EvalInterruptError, HostResources, InterruptListener, RetainedBuild,
+        RetainedScheduling, Run, RunInvocation, RunMeasurements, RunSummary, VmRetention,
         finish_or_drain, finish_or_interrupt, load_tasks, newly_completed_lines,
-        read_optional_codex_cloud_config_cache, recognized_verifier_setup, remove_passed_rootfs,
-        retained_retry_task_names, retained_task_durations, stage_diff_codex_ca_bundle,
-        verifier_bootstrap_network_failed, verifier_cache_key, verifier_network_retry_delay,
-        verifier_shell, verifier_timeout_output,
+        read_optional_codex_cloud_config_cache, retained_retry_task_names, retained_task_durations,
+        stage_diff_codex_ca_bundle,
     };
 
     #[derive(Parser)]
@@ -6148,71 +4286,6 @@ mod tests {
                 }
             })
         }
-    }
-
-    #[tokio::test]
-    async fn attempt_vmm_isolated_while_preparation_vmm_inherits_terminal_group() {
-        let inherited = recorded_vm_process_group(VmProcessGroup::Inherited).await;
-        let isolated = recorded_vm_process_group(VmProcessGroup::Isolated).await;
-        let parent_group = getpgrp().as_raw();
-
-        assert_eq!(inherited.1, parent_group);
-        assert_ne!(inherited.0, inherited.1);
-        assert_eq!(isolated.0, isolated.1);
-        assert_ne!(isolated.1, parent_group);
-    }
-
-    async fn recorded_vm_process_group(process_group: VmProcessGroup) -> (i32, i32) {
-        let directory = tempfile::tempdir().unwrap();
-        let vmm = directory.path().join("fake-vmm");
-        let record = directory.path().join("process-group");
-        fs::write(
-            &vmm,
-            "#!/bin/sh\n\
-             directory=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
-             pid=$$\n\
-             pgid=$(ps -o pgid= -p \"$pid\" | tr -d ' ')\n\
-             printf '%s %s\\n' \"$pid\" \"$pgid\" > \"$directory/process-group\"\n\
-             exec /bin/sleep 30\n",
-        )
-        .unwrap();
-        fs::set_permissions(&vmm, fs::Permissions::from_mode(0o700)).unwrap();
-        let launch = VmLaunch {
-            root: directory.path().join("root"),
-            workspace: "/workspace".to_owned(),
-            shell: "/bin/sh".to_owned(),
-            runtime_image: directory.path().join("runtime"),
-            vmm,
-            cpus: 1,
-            memory_mib: 128,
-            ext4: false,
-            resolver_configuration: String::new(),
-            environment: BTreeMap::new(),
-            network_socket: None,
-            shared_directories: Vec::new(),
-        };
-
-        let session = launch.spawn(None, process_group).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let values = loop {
-            if let Ok(contents) = fs::read_to_string(&record)
-                && let Ok(values) = contents
-                    .split_whitespace()
-                    .map(str::parse::<i32>)
-                    .collect::<Result<Vec<_>, _>>()
-                && values.len() == 2
-            {
-                break values;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{} did not contain a complete process-group record",
-                record.display()
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        drop(session);
-        (values[0], values[1])
     }
 
     #[tokio::test]
@@ -6438,24 +4511,6 @@ mod tests {
     }
 
     #[test]
-    fn vm_bootstrap_preserves_shell_words_without_libkrun_quotes() {
-        let workspace = "/workspace with 'single' and \"double\"";
-        let quoted = super::shell_word_without_double_quotes(workspace);
-        let script = format!("printf %s {quoted}");
-        assert!(!script.contains('"'));
-        let output = StdCommand::new("/bin/sh")
-            .args(["-c", &script])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, workspace.as_bytes());
-
-        let bootstrap = super::vm_guest_bootstrap_script(workspace, "nameserver 192.168.127.1\\n");
-        assert!(!bootstrap.contains('"'));
-        assert!(bootstrap.contains(&quoted));
-    }
-
-    #[test]
     fn accepts_repeated_tasks_with_per_task_trials() {
         let cli = TestCli::try_parse_from([
             "nanoeval",
@@ -6469,7 +4524,6 @@ mod tests {
             "10",
             "--max-memory-mb",
             "24576",
-            "--vm",
         ])
         .unwrap();
 
@@ -6481,7 +4535,7 @@ mod tests {
         assert_eq!(cli.eval.concurrency, Some(10));
         assert_eq!(cli.eval.max_memory_mb, Some(24_576));
         assert_eq!(cli.eval.host_utilization, DEFAULT_HOST_UTILIZATION_PERCENT);
-        assert!(cli.eval.vm);
+        assert!(cli.eval.resolve_run().unwrap().vm);
         assert!(!cli.eval.vm_retention.unwrap_or_default().retains_passes());
         assert!(cli.eval.suites.is_empty());
     }
@@ -6500,7 +4554,8 @@ mod tests {
     #[test]
     fn web_search_is_an_explicit_eval_capability() {
         let cli =
-            TestCli::try_parse_from(["nanoeval", "--task", "tasks/first", "--web-search"]).unwrap();
+            TestCli::try_parse_from(["nanoeval", "--task", "tasks/first", "--web-search", "true"])
+                .unwrap();
 
         let resolved = cli.eval.resolve_run().unwrap();
 
@@ -6513,7 +4568,6 @@ mod tests {
             "nanoeval",
             "--task",
             "tasks/first",
-            "--vm",
             "--vm-guest-runtime",
             "/opt/nanocodex-vm-guest",
         ])
@@ -6538,7 +4592,7 @@ mod tests {
         };
         fs::write(&runtime, guest_elf(wrong_machine)).unwrap();
 
-        let error = super::prepare_runtime_for_vm(true, None, Some(&runtime), job.path(), None)
+        let error = super::prepare_runtime_for_vm(None, Some(&runtime), job.path(), None)
             .await
             .unwrap_err();
 
@@ -6574,7 +4628,6 @@ mod tests {
         let source = root.path().join("mutable-workspace-guest");
         fs::write(&source, guest_elf(super::VM_GUEST_ELF_MACHINE)).unwrap();
         let (_, first_disk, first_runtime, _) = super::prepare_run_vm(
-            true,
             None,
             Some(&source),
             first.directory(),
@@ -6626,7 +4679,6 @@ mod tests {
         assert!(resumed.resumed());
         assert_eq!(resumed.directory(), job);
         let (_, resumed_disk, resumed_runtime, _) = super::prepare_run_vm(
-            true,
             None,
             None,
             resumed.directory(),
@@ -6928,15 +4980,9 @@ mod tests {
 
     #[test]
     fn passed_vm_retention_is_explicit() {
-        let cli = TestCli::try_parse_from([
-            "nanoeval",
-            "--task",
-            "tasks/first",
-            "--vm",
-            "--vm-retention",
-            "all",
-        ])
-        .unwrap();
+        let cli =
+            TestCli::try_parse_from(["nanoeval", "--task", "tasks/first", "--vm-retention", "all"])
+                .unwrap();
 
         assert!(cli.eval.vm_retention.unwrap().retains_passes());
     }
@@ -6975,17 +5021,6 @@ mod tests {
 
         assert!(matcher.is_match("terminal-bench/task.+example"));
         assert!(!matcher.is_match("terminal-bench/taskXYZexample"));
-    }
-
-    #[test]
-    fn passed_rootfs_cleanup_removes_only_a_disk_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let rootfs = directory.path().join("rootfs.ext4");
-        fs::write(&rootfs, b"guest disk").unwrap();
-
-        assert!(remove_passed_rootfs(&rootfs).unwrap());
-        assert!(!rootfs.exists());
-        assert!(!remove_passed_rootfs(directory.path()).unwrap());
     }
 
     #[test]
@@ -7303,13 +5338,6 @@ mod tests {
     }
 
     #[test]
-    fn cold_verifier_uses_the_prepared_environment_shell() {
-        assert_eq!(verifier_shell("sh", false), "sh");
-        assert_eq!(verifier_shell("bash", false), "bash");
-        assert_eq!(verifier_shell("sh", true), "/bin/bash");
-    }
-
-    #[test]
     fn requires_at_least_one_task() {
         let Err(error) = TestCli::try_parse_from(["nanoeval"]) else {
             panic!("a task should be required");
@@ -7317,149 +5345,6 @@ mod tests {
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
-        );
-    }
-
-    #[test]
-    fn cached_verifier_omits_the_complete_pinned_uv_bootstrap() {
-        assert!(CACHED_VERIFIER_SCRIPT.starts_with("/tmp/"));
-        let supported = br"#!/bin/bash
-# Install curl
-apt-get update
-apt-get install -y curl
-# Install uv
-curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
-source $HOME/.local/bin/env
-# Check if we're in a valid working directory
-uvx pytest
-";
-        let setup = recognized_verifier_setup(supported).unwrap();
-        assert!(setup.skip_setup);
-        assert_eq!(&supported[..setup.cacheable_start], b"#!/bin/bash\n");
-        let omitted = &supported[setup.cacheable_start..setup.cacheable_end];
-        assert!(omitted.windows(7).any(|window| window == b"apt-get"));
-        assert!(omitted.windows(9).any(|window| window == b"astral.sh"));
-        assert!(omitted.windows(7).any(|window| window == b"source "));
-        assert!(!omitted.windows(4).any(|window| window == b"uvx "));
-        let transformed = cached_verifier_script(supported, setup);
-        let transformed = std::str::from_utf8(&transformed).unwrap();
-        assert!(transformed.starts_with("#!/bin/bash\n"));
-        assert!(!transformed.contains("apt-get"));
-        assert!(transformed.contains("source /root/.local/bin/env"));
-        assert!(!transformed.contains("astral.sh"));
-        assert!(transformed.contains("uvx pytest"));
-
-        assert!(recognized_verifier_setup(b"pip install pytest\npytest").is_none());
-        assert!(
-            recognized_verifier_setup(
-                br"apt-get update
-apt-get install -y curl
-curl -LsSf https://astral.sh/uv/latest/install.sh | sh
-source $HOME/.local/bin/env
-# Check if we're in a valid working directory
-"
-            )
-            .is_none()
-        );
-        let custom_setup = recognized_verifier_setup(
-            br"#!/bin/bash
-apt-get update
-apt-get install -y curl git libgl1
-curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
-source $HOME/.local/bin/env
-# Check if we're in a valid working directory
-",
-        )
-        .unwrap();
-        assert!(!custom_setup.skip_setup);
-
-        let stateful_setup = recognized_verifier_setup(
-            br"#!/bin/bash
-apt-get update
-apt-get install -y curl
-touch /root/extra-state
-curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
-source $HOME/.local/bin/env
-# Check if we're in a valid working directory
-",
-        )
-        .unwrap();
-        assert!(!stateful_setup.skip_setup);
-
-        let key = verifier_cache_key(
-            std::ffi::OsStr::new("rootfs.ext4"),
-            omitted,
-            512 * 1024 * 1024,
-        );
-        let different_verifier_body = supported
-            .strip_suffix(b"uvx pytest\n")
-            .unwrap()
-            .iter()
-            .copied()
-            .chain(b"uvx python -m unittest\n".iter().copied())
-            .collect::<Vec<_>>();
-        let different_setup = recognized_verifier_setup(&different_verifier_body).unwrap();
-        assert_eq!(
-            key,
-            verifier_cache_key(
-                std::ffi::OsStr::new("rootfs.ext4"),
-                &different_verifier_body
-                    [different_setup.cacheable_start..different_setup.cacheable_end],
-                512 * 1024 * 1024,
-            )
-        );
-    }
-
-    #[test]
-    fn retries_only_dependency_bootstrap_network_failures() {
-        let dns_failure = VmCommandOutput {
-            exit_code: 0,
-            stdout: b"curl: (6) Could not resolve host: astral.sh\n\
-                /tests/test.sh: line 19: uvx: command not found\n"
-                .to_vec(),
-            stderr: Vec::new(),
-        };
-        assert!(verifier_bootstrap_network_failed(&dns_failure));
-
-        let gateway_failure = VmCommandOutput {
-            exit_code: 0,
-            stdout: b"failed to download https://github.com/astral-sh/uv/releases/download/uv\n\
-                curl: (22) The requested URL returned error: 504\n\
-                /tests/test.sh: line 19: uvx: command not found\n"
-                .to_vec(),
-            stderr: Vec::new(),
-        };
-        assert!(verifier_bootstrap_network_failed(&gateway_failure));
-
-        let apt_dns_failure = VmCommandOutput {
-            exit_code: 100,
-            stdout: Vec::new(),
-            stderr: b"Temporary failure resolving 'deb.debian.org'\n".to_vec(),
-        };
-        assert!(verifier_bootstrap_network_failed(&apt_dns_failure));
-
-        let genuine_test_failure = VmCommandOutput {
-            exit_code: 0,
-            stdout: b"FAILED test_outputs.py::test_data_matches\n\
-                AssertionError: result.txt contains unexpected value\n"
-                .to_vec(),
-            stderr: Vec::new(),
-        };
-        assert!(!verifier_bootstrap_network_failed(&genuine_test_failure));
-
-        let task_owned_download_failure = VmCommandOutput {
-            exit_code: 0,
-            stdout: b"Could not resolve host: github.com\nFAILED test_outputs.py\n".to_vec(),
-            stderr: Vec::new(),
-        };
-        assert!(!verifier_bootstrap_network_failed(
-            &task_owned_download_failure
-        ));
-        assert_eq!(
-            (0..=4)
-                .map(verifier_network_retry_delay)
-                .collect::<Vec<_>>(),
-            [2, 4, 8, 16, 32].map(std::time::Duration::from_secs)
         );
     }
 
@@ -7541,106 +5426,6 @@ esac
             RunSummary::from_attempts(&[super::AttemptOutcome::from_result(result.clone())]);
         assert_eq!(summary.billing_missing, 1);
         server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn same_vm_verifier_staging_normalizes_file_and_directory_mtimes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let source = tempfile::tempdir().unwrap();
-        let nested = source.path().join("nested");
-        fs::create_dir(&nested).unwrap();
-        let file = source.path().join("test.sh");
-        fs::write(&file, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(source.path(), fs::Permissions::from_mode(0o751)).unwrap();
-        fs::set_permissions(&nested, fs::Permissions::from_mode(0o711)).unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
-
-        let control = tempfile::tempdir().unwrap();
-        let journal = control.path().join("requests.jsonl");
-        let script = r#"
-request_id=0
-while IFS= read -r request; do
-    printf '%s\n' "$request" >> "$1"
-    case "$request" in
-        *'"kind":"create_directory"'*) kind=create_directory ;;
-        *'"kind":"write_file"'*) kind=write_file ;;
-        *'"kind":"shutdown"'*) kind=shutdown ;;
-        *) exit 91 ;;
-    esac
-    printf '{"kind":"%s","payload":{"id":%s,"error":null}}\n' "$kind" "$request_id"
-    if [ "$kind" = shutdown ]; then
-        exit 0
-    fi
-    request_id=$((request_id + 1))
-done
-"#;
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(script)
-            .arg("nanocodex-verifier-staging")
-            .arg(&journal);
-        let session = VmToolSession::spawn(&mut command).unwrap();
-
-        VmVerifier::copy_directory(&session, source.path(), source.path(), Path::new("/tests"))
-            .await
-            .unwrap();
-        session.shutdown().await.unwrap();
-
-        let requests = fs::read_to_string(&journal)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let writes = requests
-            .iter()
-            .filter(|request| request["kind"] == "write_file")
-            .collect::<Vec<_>>();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0]["payload"]["path"], "/tests/test.sh");
-        assert_eq!(writes[0]["payload"]["mode"], 0o640);
-        assert_eq!(writes[0]["payload"]["modified_unix_seconds"], 0);
-
-        for (path, final_mode) in [("/tests", 0o751), ("/tests/nested", 0o711)] {
-            let creates = requests
-                .iter()
-                .filter(|request| {
-                    request["kind"] == "create_directory"
-                        && request["payload"]["path"]
-                            .as_str()
-                            .is_some_and(|actual| Path::new(actual) == Path::new(path))
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(creates.len(), 2, "{path} must be opened then finalized");
-            assert_eq!(creates[0]["payload"]["mode"], 0o700);
-            assert!(creates[0]["payload"].get("modified_unix_seconds").is_none());
-            assert_eq!(creates[1]["payload"]["mode"], final_mode);
-            assert_eq!(creates[1]["payload"]["modified_unix_seconds"], 0);
-        }
-    }
-
-    #[test]
-    fn verifier_timeout_preserves_partial_output_bytes() {
-        let output = verifier_timeout_output(
-            Duration::from_secs(17),
-            VmCommandPartialOutput {
-                stdout: vec![0, 0xff, b'\n'],
-                stderr: vec![0x80, b'\n'],
-            },
-        );
-
-        assert_eq!(output.exit_code, 124);
-        assert_eq!(output.stdout, [0, 0xff, b'\n']);
-        assert_eq!(
-            output.stderr,
-            [
-                &[0x80, b'\n'][..],
-                b"\ncanonical verifier exceeded its 17s deadline; \
-                  the candidate is scored with reward 0\n",
-            ]
-            .concat()
-        );
     }
 
     fn guest_elf(machine: u16) -> Vec<u8> {

@@ -56,7 +56,7 @@ enum Command {
     /// Inspect or purchase Nanocodex NANOUSD credits.
     #[cfg(feature = "tempo")]
     Credits(credits::Credits),
-    /// Run and inspect durable native agent evaluations.
+    /// Run and inspect durable VM-backed agent evaluations.
     Eval(eval::Eval),
     /// Internal entrypoint for one dedicated libkrun VMM process.
     #[command(hide = true)]
