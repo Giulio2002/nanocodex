@@ -176,25 +176,6 @@ declare const tools: {{ {global_name}({input_name}: {input_type}): Promise<{outp
     description
 }
 
-/// Matches Codex's Code Mode prompt order: plain tools first, followed by
-/// namespaced tools ordered by namespace and member name.
-pub(crate) fn sort_definitions(definitions: &mut [ToolDefinition]) {
-    definitions.sort_by(|left, right| {
-        let (left_namespace, left_name) = code_mode_namespace_and_name(left.name())
-            .map_or((None, left.name()), |(namespace, name)| {
-                (Some(namespace), name)
-            });
-        let (right_namespace, right_name) = code_mode_namespace_and_name(right.name())
-            .map_or((None, right.name()), |(namespace, name)| {
-                (Some(namespace), name)
-            });
-        left_namespace
-            .cmp(&right_namespace)
-            .then_with(|| left_name.cmp(right_name))
-            .then_with(|| left.name().cmp(right.name()))
-    });
-}
-
 fn code_mode_namespace_and_name(name: &str) -> Option<(&str, &str)> {
     let (namespace, name) = name.split_once("__")?;
     (!namespace.is_empty() && !name.is_empty()).then_some((namespace, name))
@@ -422,7 +403,8 @@ mod tests {
     use nanocodex_oai_api::tools::ToolDefinition;
     use serde_json::json;
 
-    use super::{exec_description, render_json_schema_to_typescript, sort_definitions};
+    use super::{exec_description, render_json_schema_to_typescript};
+    use crate::code_mode_order::sort_definitions;
 
     #[test]
     fn renders_described_object_as_typescript() {

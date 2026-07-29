@@ -17,6 +17,8 @@ mod apply_patch;
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub mod code_mode;
 #[cfg(feature = "native")]
+mod code_mode_order;
+#[cfg(feature = "native")]
 pub mod hosted;
 #[cfg(all(not(target_family = "wasm"), feature = "native"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
