@@ -208,14 +208,15 @@ Part 3 is complete when:
 Current status (2026-07-28): PR #58 is merged. Draft PR #61 now integrates the
 owned evaluator, Harbor-compatible presentation, complete `nanocodex eval`
 command tree, stock-Codex capture proxy, paired runner, semantic differ, task
-inventory, and running log on current `master`. A fresh local smoke from
-implementation commit `cf636609a616293258f4427b86e3bb787daa2c0f` passed
-both ordinary Nanocodex evaluation and concurrent matched-profile Codex
-differential evaluation through automatically built, commit-bound guest
-runtimes. The schema-v5 differ exposed the first request drift live and
-preserved exact API, ATIF, event, and verifier evidence. The current
-per-attempt VM adapter is not yet the task-worker allocation described above,
-so no one-VM-per-task or host-saturation claim is complete.
+inventory, and running log on current `master`. After integrating
+`origin/master` through `a2242a26`, a fresh local smoke from implementation
+merge `47b236d11c6addee64f2885c5909560b47069f4a` passed both ordinary
+Nanocodex evaluation and concurrent matched-profile Codex differential
+evaluation through automatically built, commit-bound guest runtimes. The
+schema-v5 differ exposed both the first request drift and a one-turn outer-loop
+variance live while preserving exact API, ATIF, event, and verifier evidence.
+The current per-attempt VM adapter is not yet the task-worker allocation
+described above, so no one-VM-per-task or host-saturation claim is complete.
 
 ## Current execution order
 

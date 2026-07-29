@@ -170,6 +170,32 @@ exactly. This metadata check does not make Harbor part of task execution.
   `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/comparison.json`;
   `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/api-comparison.json`;
   `/private/tmp/nanocodex-eval-vm-diff.0uCTMX/019fabd2-1fad-77d1-9cd6-0404e084013e/progress.jsonl`
+- 2026-07-28 (artifacts recorded in UTC on 2026-07-29): after merging current
+  `origin/master` through `a2242a26`, implementation merge
+  `47b236d11c6addee64f2885c5909560b47069f4a` passed the ordinary and paired
+  `nanoeval/write-greeting` VM smokes again. The ordinary run retained the
+  merge SHA as its automatic `host_commit_source`, emitted 82 ordered events,
+  and passed with reward `1`.
+- This paired repetition also passed both arms with reward `1`, but usefully
+  produced different outer-loop shapes under the same matched profile.
+  Nanocodex completed in three terminal Responses turns with model-visible
+  tools `[exec]`; stock Codex completed in four with `[exec, exec]`. Each
+  retained a stable prompt-cache key and internally valid previous-response
+  and tool-result links. Neither arm took a polling-only turn.
+- The live differ reported the first configuration drift at 10.105 seconds
+  while both arms were active. Nanocodex completed at 12.857 seconds with
+  13,113 total tokens; stock Codex completed at 19.507 seconds with 25,420.
+  Stock therefore had one unpaired generation turn in this sample. This is
+  retained as per-repetition loop evidence, not attributed to the merged shell
+  environment change or promoted into a general performance claim.
+- Latest-master ordinary evidence:
+  `/private/tmp/nanocodex-eval-vm-smoke-master.sJmfs3/019fabd6-6d72-7160-ae51-0203cfda799e/result.json`;
+  `/private/tmp/nanocodex-eval-vm-smoke-master.sJmfs3/019fabd6-6d72-7160-ae51-0203cfda799e/invocation.json`;
+  `/private/tmp/nanocodex-eval-vm-smoke-master.sJmfs3/019fabd6-6d72-7160-ae51-0203cfda799e/write-greeting__default__001__019fabd685797c0288f091ede2702d65/agent/trajectory.json`
+- Latest-master paired evidence:
+  `/private/tmp/nanocodex-eval-vm-diff-master.uHXkHW/019fabd6-90e1-7b32-ae58-9f2024ca908f/comparison.json`;
+  `/private/tmp/nanocodex-eval-vm-diff-master.uHXkHW/019fabd6-90e1-7b32-ae58-9f2024ca908f/api-comparison.json`;
+  `/private/tmp/nanocodex-eval-vm-diff-master.uHXkHW/019fabd6-90e1-7b32-ae58-9f2024ca908f/progress.jsonl`
 
 ## Task 1 diagnosis: `adaptive-rejection-sampler`
 
