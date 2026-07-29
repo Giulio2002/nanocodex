@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 6;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 7;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -590,6 +590,8 @@ struct ApiEventLoopComparison {
     differing_turns: u64,
     first_divergence: Option<ApiEventLoopFirstDivergence>,
     first_generation_divergence: Option<ApiEventLoopFirstDivergence>,
+    nanocodex_unpaired_tail: Option<ApiEventLoopTailSummary>,
+    codex_unpaired_tail: Option<ApiEventLoopTailSummary>,
     nanocodex: Option<ApiEventLoopArmSummary>,
     codex: Option<ApiEventLoopArmSummary>,
 }
@@ -599,6 +601,27 @@ struct ApiEventLoopFirstDivergence {
     request_index: u64,
     pointer: String,
     categories: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+struct ApiEventLoopTailSummary {
+    turns: u64,
+    generation_turns: u64,
+    tool_call_turns: u64,
+    detected_poll_only_turns: u64,
+    turns_with_usage: u64,
+    turns_without_usage: u64,
+    usage: ApiTokenUsageSummary,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+struct ApiTokenUsageSummary {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -648,6 +671,59 @@ impl ApiEventLoopArmSummary {
     }
 }
 
+impl ApiEventLoopTrace {
+    fn unpaired_tail(&self, aligned_turns: usize) -> ApiEventLoopTailSummary {
+        ApiEventLoopTailSummary::from_turns(
+            self.turn_metrics.get(aligned_turns..).unwrap_or_default(),
+        )
+    }
+}
+
+impl ApiEventLoopTailSummary {
+    fn from_turns(turns: &[ApiEventLoopTurnMetrics]) -> Self {
+        let mut summary = Self {
+            turns: u64::try_from(turns.len()).unwrap_or(u64::MAX),
+            ..Self::default()
+        };
+        for turn in turns {
+            if turn.generation {
+                summary.generation_turns = summary.generation_turns.saturating_add(1);
+            }
+            if turn.tool_calls > 0 {
+                summary.tool_call_turns = summary.tool_call_turns.saturating_add(1);
+            }
+            if turn.detected_poll_only {
+                summary.detected_poll_only_turns =
+                    summary.detected_poll_only_turns.saturating_add(1);
+            }
+            if let Some(usage) = &turn.usage {
+                summary.turns_with_usage = summary.turns_with_usage.saturating_add(1);
+                summary.usage.add(usage);
+            } else {
+                summary.turns_without_usage = summary.turns_without_usage.saturating_add(1);
+            }
+        }
+        summary
+    }
+}
+
+impl ApiTokenUsageSummary {
+    const fn add(&mut self, usage: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.uncached_input_tokens = self
+            .uncached_input_tokens
+            .saturating_add(usage.uncached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(usage.reasoning_output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+}
+
 #[derive(Serialize)]
 struct ApiEventLoopTurnComparison {
     equal: bool,
@@ -686,7 +762,15 @@ struct ApiRequestPayload {
 
 struct ApiEventLoopTrace {
     turns: Vec<serde_json::Value>,
+    turn_metrics: Vec<ApiEventLoopTurnMetrics>,
     summary: ApiEventLoopArmSummary,
+}
+
+struct ApiEventLoopTurnMetrics {
+    generation: bool,
+    tool_calls: u64,
+    detected_poll_only: bool,
+    usage: Option<ApiTokenUsageSummary>,
 }
 
 #[derive(Clone, Default)]
@@ -2526,6 +2610,7 @@ impl DifferentialReport {
         append_arm_summary(&mut output, "codex", &self.codex);
         append_model_visible_tool_summary(&mut output, &self.api_comparison.event_loop);
         append_first_generation_divergence(&mut output, &self.api_comparison.event_loop);
+        append_unpaired_tail_summary(&mut output, &self.api_comparison.event_loop);
         let _ = writeln!(
             output,
             "live progress: {}",
@@ -3682,6 +3767,7 @@ fn reanalyze_inner(path: &Path) -> InternalResult<DifferentialReanalysis> {
             "codex",
             summary.event_loop.codex.as_ref(),
         );
+        append_unpaired_tail_summary(&mut human_summary, &summary.event_loop);
         if let Some(error) = &profile_validation_error {
             let _ = writeln!(human_summary, "matched-profile error: {error}");
         }
@@ -3833,6 +3919,39 @@ fn append_first_generation_divergence(output: &mut String, comparison: &ApiEvent
         divergence.request_index,
         divergence.categories.join(","),
         divergence.pointer,
+    );
+}
+
+fn append_unpaired_tail_summary(output: &mut String, comparison: &ApiEventLoopComparison) {
+    let (Some(nanocodex), Some(codex)) = (
+        comparison.nanocodex_unpaired_tail.as_ref(),
+        comparison.codex_unpaired_tail.as_ref(),
+    ) else {
+        return;
+    };
+    if nanocodex.turns == 0 && codex.turns == 0 {
+        return;
+    }
+    let format = |tail: &ApiEventLoopTailSummary| {
+        format!(
+            "{} turns/{} generation/{} poll-only · {} total tokens ({} cached + {} uncached input, {} output, {} reasoning) · usage {}/{}",
+            tail.turns,
+            tail.generation_turns,
+            tail.detected_poll_only_turns,
+            tail.usage.total_tokens,
+            tail.usage.cached_input_tokens,
+            tail.usage.uncached_input_tokens,
+            tail.usage.output_tokens,
+            tail.usage.reasoning_output_tokens,
+            tail.turns_with_usage,
+            tail.turns,
+        )
+    };
+    let _ = writeln!(
+        output,
+        "unpaired API tail: nanocodex [{}] · codex [{}]",
+        format(nanocodex),
+        format(codex),
     );
 }
 
@@ -4058,6 +4177,12 @@ fn compare_api_exchanges(
                 .zip(codex.summary.initial_code_mode_tools.as_ref())
                 .map(|(nanocodex, codex)| nanocodex == codex)
         });
+    let nanocodex_unpaired_tail = nanocodex_event_loop
+        .as_ref()
+        .map(|trace| trace.unpaired_tail(aligned_request_count));
+    let codex_unpaired_tail = codex_event_loop
+        .as_ref()
+        .map(|trace| trace.unpaired_tail(aligned_request_count));
     let event_loop = ApiEventLoopComparison {
         comparable,
         request_count_equal,
@@ -4072,6 +4197,8 @@ fn compare_api_exchanges(
         differing_turns: differing_event_loop_turns,
         first_divergence: first_event_loop_divergence,
         first_generation_divergence,
+        nanocodex_unpaired_tail,
+        codex_unpaired_tail,
         nanocodex: nanocodex_event_loop.map(|trace| trace.summary),
         codex: codex_event_loop.map(|trace| trace.summary),
     };
@@ -4137,6 +4264,8 @@ impl ApiEventLoopComparison {
             differing_turns: 0,
             first_divergence: None,
             first_generation_divergence: None,
+            nanocodex_unpaired_tail: None,
+            codex_unpaired_tail: None,
             nanocodex: None,
             codex: None,
         }
@@ -4279,6 +4408,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let mut detected_poll_only_cached_tokens = 0_u64;
     let mut detected_poll_only_output_tokens = 0_u64;
     let mut turns = Vec::with_capacity(requests.len());
+    let mut turn_metrics = Vec::with_capacity(requests.len());
 
     for (offset, request) in requests.iter().enumerate() {
         let generation = request
@@ -4339,11 +4469,12 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
         let response_tools = response_tool_items(&request.response_events)
             .filter_map(visible_tool_name)
             .collect::<Vec<_>>();
-        if !response_tools.is_empty() {
+        let response_tool_count = u64::try_from(response_tools.len()).unwrap_or(u64::MAX);
+        if response_tool_count > 0 {
             tool_call_turns = tool_call_turns.saturating_add(1);
         }
         model_visible_tool_sequence.extend(response_tools);
-        if generation {
+        let detected_poll_only = if generation {
             if let Some(polling) = detected_polling_turn(&request.response_events) {
                 detected_poll_only_turns = detected_poll_only_turns.saturating_add(1);
                 consecutive_detected_poll_only_turns =
@@ -4358,10 +4489,14 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
                     detected_poll_only_cached_tokens.saturating_add(polling.cached_tokens);
                 detected_poll_only_output_tokens =
                     detected_poll_only_output_tokens.saturating_add(polling.output_tokens);
+                true
             } else {
                 consecutive_detected_poll_only_turns = 0;
+                false
             }
-        }
+        } else {
+            false
+        };
         if request
             .response_events
             .iter()
@@ -4374,6 +4509,12 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             "request": normalized_request,
             "response": normalized_response,
         }));
+        turn_metrics.push(ApiEventLoopTurnMetrics {
+            generation,
+            tool_calls: response_tool_count,
+            detected_poll_only,
+            usage: api_response_usage(&request.response_events),
+        });
 
         previous_response_id = response_id(&request.response_events);
         previous_call_ids = response_call_ids(&request.response_events);
@@ -4381,6 +4522,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
 
     ApiEventLoopTrace {
         turns,
+        turn_metrics,
         summary: ApiEventLoopArmSummary {
             turns: u64::try_from(requests.len()).unwrap_or(u64::MAX),
             generation_turns,
@@ -4474,6 +4616,41 @@ fn response_tool_items(events: &[serde_json::Value]) -> impl Iterator<Item = &se
         })
 }
 
+fn api_response_usage(events: &[serde_json::Value]) -> Option<ApiTokenUsageSummary> {
+    let usage = events
+        .iter()
+        .rev()
+        .find_map(|event| event.pointer("/response/usage"))?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let cached_input_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let reasoning_output_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+    Some(ApiTokenUsageSummary {
+        input_tokens,
+        cached_input_tokens,
+        uncached_input_tokens: input_tokens.saturating_sub(cached_input_tokens),
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    })
+}
+
 fn detected_polling_turn(events: &[serde_json::Value]) -> Option<DetectedPollingTurn> {
     let tool_items = response_tool_items(events).collect::<Vec<_>>();
     if tool_items.is_empty() {
@@ -4482,24 +4659,12 @@ fn detected_polling_turn(events: &[serde_json::Value]) -> Option<DetectedPolling
     let empty_stdin_calls = tool_items.iter().try_fold(0_u64, |total, item| {
         detected_empty_stdin_calls(item).map(|calls| total.saturating_add(calls))
     })?;
-    let usage = events
-        .iter()
-        .rev()
-        .find_map(|event| event.pointer("/response/usage"));
+    let usage = api_response_usage(events).unwrap_or_default();
     Some(DetectedPollingTurn {
         empty_stdin_calls,
-        input_tokens: usage
-            .and_then(|usage| usage.get("input_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default(),
-        cached_tokens: usage
-            .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .and_then(|usage| usage.get("output_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default(),
+        input_tokens: usage.input_tokens,
+        cached_tokens: usage.cached_input_tokens,
+        output_tokens: usage.output_tokens,
     })
 }
 
@@ -4995,12 +5160,12 @@ mod tests {
     };
 
     use super::{
-        ApiRequestPayload, ArmStatus, CodexExec, CodexVersion, DIFF_CODEX_CA_BUNDLE_FILENAME,
-        DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME, DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT,
-        DiffCodexCaSource, DiffProgress, Evaluator, LaneProgressState, ShellPollingSummary, Task,
-        TrajectoryProjection, build_event_loop_trace, compare_api_exchanges,
-        detected_code_mode_empty_stdin_calls, detected_polling_turn, diff_json,
-        event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
+        ApiEventLoopTailSummary, ApiRequestPayload, ApiTokenUsageSummary, ArmStatus, CodexExec,
+        CodexVersion, DIFF_CODEX_CA_BUNDLE_FILENAME, DIFF_CODEX_CLOUD_CONFIG_CACHE_FILENAME,
+        DIFF_CODEX_SSL_CERT_FILE_ENVIRONMENT, DiffCodexCaSource, DiffProgress, Evaluator,
+        LaneProgressState, ShellPollingSummary, Task, TrajectoryProjection, build_event_loop_trace,
+        compare_api_exchanges, detected_code_mode_empty_stdin_calls, detected_polling_turn,
+        diff_json, event_loop_difference_categories, heartbeat_needed, heartbeat_summary,
         inspect_api_exchanges, newly_completed_lines, read_api_request_payloads,
         read_optional_codex_cloud_config_cache, run_arm, stage_diff_codex_ca_bundle,
         validate_matched_code_mode_only_profile,
@@ -5467,6 +5632,19 @@ mod tests {
         assert_eq!(summary.event_loop.nanocodex_unpaired_turns, 0);
         assert_eq!(summary.event_loop.codex_unpaired_turns, 1);
         assert_eq!(
+            summary.event_loop.nanocodex_unpaired_tail.as_ref().unwrap(),
+            &ApiEventLoopTailSummary::default()
+        );
+        assert_eq!(
+            summary.event_loop.codex_unpaired_tail.as_ref().unwrap(),
+            &ApiEventLoopTailSummary {
+                turns: 1,
+                generation_turns: 1,
+                turns_without_usage: 1,
+                ..ApiEventLoopTailSummary::default()
+            }
+        );
+        assert_eq!(
             summary.event_loop.initial_code_mode_tool_catalog_equal,
             Some(true)
         );
@@ -5510,7 +5688,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 6);
+        assert_eq!(report["schema_version"], 7);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5790,6 +5968,79 @@ mod tests {
                 "await tools.write_stdin({session_id: 2}); await tools.exec_command({cmd: \"pwd\"});"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn event_loop_unpaired_tail_aggregates_cache_and_poll_cost() {
+        let completed = |input, cached, output, reasoning, total| {
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": format!("response-{total}"),
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": input,
+                        "input_tokens_details": {"cached_tokens": cached},
+                        "output_tokens": output,
+                        "output_tokens_details": {"reasoning_tokens": reasoning},
+                        "total_tokens": total
+                    }
+                }
+            })
+        };
+        let request = |request_index, response_events| ApiRequestPayload {
+            request_index,
+            phase: Some("generation".to_owned()),
+            payload: serde_json::json!({
+                "type": "response.create",
+                "model": "gpt-test",
+                "generate": true,
+                "input": []
+            }),
+            sha256: format!("request-{request_index}"),
+            response_events,
+        };
+        let requests = vec![
+            request(1, vec![completed(10, 0, 3, 1, 13)]),
+            request(
+                2,
+                vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "custom_tool_call",
+                            "name": "exec",
+                            "call_id": "poll",
+                            "input": "await tools.write_stdin({session_id: 2});"
+                        }
+                    }),
+                    completed(100, 80, 10, 4, 110),
+                ],
+            ),
+            request(3, vec![completed(120, 100, 5, 2, 125)]),
+        ];
+
+        let tail = build_event_loop_trace(&requests).unpaired_tail(1);
+
+        assert_eq!(
+            tail,
+            ApiEventLoopTailSummary {
+                turns: 2,
+                generation_turns: 2,
+                tool_call_turns: 1,
+                detected_poll_only_turns: 1,
+                turns_with_usage: 2,
+                turns_without_usage: 0,
+                usage: ApiTokenUsageSummary {
+                    input_tokens: 220,
+                    cached_input_tokens: 180,
+                    uncached_input_tokens: 40,
+                    output_tokens: 15,
+                    reasoning_output_tokens: 6,
+                    total_tokens: 235,
+                },
+            }
         );
     }
 
