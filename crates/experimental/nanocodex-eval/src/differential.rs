@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 8;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 9;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -646,6 +646,7 @@ struct ApiEventLoopArmSummary {
     prompt_cache_key_stable: Option<bool>,
     previous_response_links: u64,
     full_history_replays: u64,
+    full_history_replays_after_nonterminal_turn: u64,
     broken_previous_response_links: u64,
     tool_result_links: u64,
     replayed_tool_result_links: u64,
@@ -668,6 +669,8 @@ impl ApiEventLoopArmSummary {
             && self.prompt_cache_key_stable == other.prompt_cache_key_stable
             && self.previous_response_links == other.previous_response_links
             && self.full_history_replays == other.full_history_replays
+            && self.full_history_replays_after_nonterminal_turn
+                == other.full_history_replays_after_nonterminal_turn
             && self.broken_previous_response_links == other.broken_previous_response_links
             && self.tool_result_links == other.tool_result_links
             && self.replayed_tool_result_links == other.replayed_tool_result_links
@@ -3855,7 +3858,7 @@ fn append_event_loop_arm_summary(
     };
     let _ = writeln!(
         output,
-        "{name} event loop: {}/{} terminal · {} generation turns · model-visible calls {} [{}] · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {} direct/{} replay/{} broken · tool-result links {} valid/{} replayed/{} broken · cache stable {}",
+        "{name} event loop: {}/{} terminal · {} generation turns · model-visible calls {} [{}] · profile {}/{}/summary={} · visible tools [{}] · {} detected poll-only · previous links {} direct/{} replay ({} after nonterminal)/{} broken · tool-result links {} valid/{} replayed/{} broken · cache stable {}",
         summary.terminal_turns,
         summary.turns,
         summary.generation_turns,
@@ -3874,6 +3877,7 @@ fn append_event_loop_arm_summary(
         summary.detected_poll_only_turns,
         summary.previous_response_links,
         summary.full_history_replays,
+        summary.full_history_replays_after_nonterminal_turn,
         summary.broken_previous_response_links,
         summary.tool_result_links,
         summary.replayed_tool_result_links,
@@ -4401,6 +4405,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let mut previous_call_ids = BTreeSet::new();
     let mut previous_response_links = 0_u64;
     let mut full_history_replays = 0_u64;
+    let mut full_history_replays_after_nonterminal_turn = 0_u64;
     let mut broken_previous_response_links = 0_u64;
     let mut tool_result_links = 0_u64;
     let mut replayed_tool_result_links = 0_u64;
@@ -4418,6 +4423,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let mut detected_poll_only_output_tokens = 0_u64;
     let mut turns = Vec::with_capacity(requests.len());
     let mut turn_metrics = Vec::with_capacity(requests.len());
+    let mut previous_turn_terminal = false;
 
     for (offset, request) in requests.iter().enumerate() {
         let generation = request
@@ -4451,6 +4457,10 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
                 previous_response_links = previous_response_links.saturating_add(1);
             } else if full_history_replay {
                 full_history_replays = full_history_replays.saturating_add(1);
+                if !previous_turn_terminal {
+                    full_history_replays_after_nonterminal_turn =
+                        full_history_replays_after_nonterminal_turn.saturating_add(1);
+                }
             } else {
                 broken_previous_response_links = broken_previous_response_links.saturating_add(1);
             }
@@ -4516,11 +4526,11 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
         } else {
             false
         };
-        if request
+        let turn_terminal = request
             .response_events
             .iter()
-            .any(|event| api_event_type(event).is_some_and(|kind| is_terminal_api_event(&kind)))
-        {
+            .any(|event| api_event_type(event).is_some_and(|kind| is_terminal_api_event(&kind)));
+        if turn_terminal {
             terminal_turns = terminal_turns.saturating_add(1);
         }
         turns.push(serde_json::json!({
@@ -4537,6 +4547,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
 
         previous_response_id = response_id(&request.response_events);
         previous_call_ids = response_call_ids(&request.response_events);
+        previous_turn_terminal = turn_terminal;
     }
 
     ApiEventLoopTrace {
@@ -4564,6 +4575,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             prompt_cache_key_stable,
             previous_response_links,
             full_history_replays,
+            full_history_replays_after_nonterminal_turn,
             broken_previous_response_links,
             tool_result_links,
             replayed_tool_result_links,
@@ -5748,7 +5760,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 8);
+        assert_eq!(report["schema_version"], 9);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5888,6 +5900,7 @@ mod tests {
                 }
             }),
         );
+        requests[1].response_events.truncate(1);
         requests.push(ApiRequestPayload {
             request_index: 3,
             phase: Some("generation".to_owned()),
@@ -5928,6 +5941,7 @@ mod tests {
 
         assert_eq!(trace.summary.previous_response_links, 1);
         assert_eq!(trace.summary.full_history_replays, 1);
+        assert_eq!(trace.summary.full_history_replays_after_nonterminal_turn, 1);
         assert_eq!(trace.summary.broken_previous_response_links, 0);
         assert_eq!(trace.summary.tool_result_links, 1);
         assert_eq!(trace.summary.replayed_tool_result_links, 1);
