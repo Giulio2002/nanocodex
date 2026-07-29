@@ -274,8 +274,9 @@ impl Task {
                 NetworkPolicy::Disabled
             },
             environment: raw.environment.env,
-            requires_compose: raw.metadata.custom_docker_compose
-                || raw.environment.custom_docker_compose,
+            requires_compose: raw.environment.custom_docker_compose
+                || (raw.metadata.custom_docker_compose
+                    && !raw.metadata.moved_workdir_from_compose_to_dockerfile),
         };
         task.validate_package()?;
         Ok(task)
@@ -562,6 +563,8 @@ struct RawTask {
 struct RawMetadata {
     #[serde(default)]
     custom_docker_compose: bool,
+    #[serde(default)]
+    moved_workdir_from_compose_to_dockerfile: bool,
 }
 
 #[derive(Deserialize)]
@@ -794,6 +797,45 @@ MODE = "test"
         assert_eq!(task.environment()["MODE"], "test");
         assert_eq!(task.verifier().environment()["ANSWER"], "42");
         assert!(task.requires_compose());
+    }
+
+    #[test]
+    fn loads_migrated_compose_task_as_a_single_image() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("tests")).unwrap();
+        fs::create_dir(directory.path().join("environment")).unwrap();
+        fs::write(
+            directory.path().join("task.toml"),
+            r#"
+schema_version = "1.1"
+
+[task]
+name = "terminal-bench/migrated-compose"
+
+[metadata]
+custom_docker_compose = true
+moved_workdir_from_compose_to_dockerfile = true
+
+[agent]
+timeout_sec = 900.0
+
+[verifier]
+timeout_sec = 600.0
+
+[environment]
+docker_image = "example/task:20251031"
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+"#,
+        )
+        .unwrap();
+        fs::write(directory.path().join("instruction.md"), "Fix the task.").unwrap();
+        fs::write(directory.path().join("tests/test.sh"), "#!/bin/sh\n").unwrap();
+
+        let task = Task::load(directory.path()).unwrap();
+
+        assert!(!task.requires_compose());
     }
 
     #[test]
