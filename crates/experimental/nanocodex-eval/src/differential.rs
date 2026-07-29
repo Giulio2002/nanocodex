@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 10;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 11;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -582,6 +582,8 @@ struct ApiEventLoopComparison {
     request_count_equal: Option<bool>,
     chain_invariants_equal: Option<bool>,
     model_visible_tool_sequence_equal: Option<bool>,
+    initial_input_text_sections_equal: Option<bool>,
+    initial_generation_input_text_sections_equal: Option<bool>,
     initial_code_mode_tool_names_equal: Option<bool>,
     initial_code_mode_tool_definitions_equal: Option<bool>,
     aligned_turns: u64,
@@ -637,6 +639,8 @@ struct ApiEventLoopArmSummary {
     initial_reasoning_effort: Option<String>,
     initial_reasoning_summary: Option<String>,
     initial_visible_tools: Vec<String>,
+    initial_input_text_sections: Vec<ApiInputTextSectionSummary>,
+    initial_generation_input_text_sections: Vec<ApiInputTextSectionSummary>,
     initial_code_mode_tools: Option<Vec<String>>,
     initial_code_mode_tool_definitions: Option<Vec<ApiCodeModeToolDefinitionSummary>>,
     detected_poll_only_turns: u64,
@@ -661,6 +665,16 @@ struct ApiCodeModeToolDefinitionSummary {
     ordinal: u64,
     section_bytes: u64,
     section_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ApiInputTextSectionSummary {
+    item_ordinal: u64,
+    content_ordinal: u64,
+    role: String,
+    label: String,
+    text_bytes: u64,
+    text_sha256: String,
 }
 
 #[derive(Default)]
@@ -3893,6 +3907,31 @@ fn append_model_visible_tool_summary(output: &mut String, comparison: &ApiEventL
     else {
         return;
     };
+    let format_input_text_sections = |sections: &[ApiInputTextSectionSummary]| {
+        sections
+            .iter()
+            .map(|section| format!("{}/{}:{}B", section.role, section.label, section.text_bytes))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(
+        output,
+        "initial model input text: nanocodex [{}] · codex [{}] · match {}",
+        format_input_text_sections(&nanocodex.initial_input_text_sections),
+        format_input_text_sections(&codex.initial_input_text_sections),
+        comparison
+            .initial_input_text_sections_equal
+            .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
+    );
+    let _ = writeln!(
+        output,
+        "initial generation input text: nanocodex [{}] · codex [{}] · match {}",
+        format_input_text_sections(&nanocodex.initial_generation_input_text_sections),
+        format_input_text_sections(&codex.initial_generation_input_text_sections),
+        comparison
+            .initial_generation_input_text_sections_equal
+            .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
+    );
     let _ = writeln!(
         output,
         "model-visible tool sequence: nanocodex [{}] · codex [{}] · match {}",
@@ -4009,11 +4048,19 @@ fn validate_matched_code_mode_only_profile(
     };
     let nanocodex_matches = arm_matches(nanocodex);
     let codex_matches = arm_matches(codex);
-    if nanocodex_matches && codex_matches {
+    let model_input_matches = summary.event_loop.initial_input_text_sections_equal == Some(true)
+        && summary
+            .event_loop
+            .initial_generation_input_text_sections_equal
+            == Some(true);
+    let code_mode_catalog_matches = summary.event_loop.initial_code_mode_tool_names_equal
+        == Some(true)
+        && summary.event_loop.initial_code_mode_tool_definitions_equal == Some(true);
+    if nanocodex_matches && codex_matches && model_input_matches && code_mode_catalog_matches {
         return None;
     }
     Some(format!(
-        "expected both first API requests to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, and only [exec, wait] for the pinned code_mode_only profile; nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}]",
+        "expected both first API requests to use model={expected_model}, effort={expected_effort}, reasoning.summary=auto, only [exec, wait], and identical initial input text plus nested Code Mode definitions for the pinned code_mode_only profile; nanocodex={}/{}/summary={}/[{}], codex={}/{}/summary={}/[{}], initial_input_text_equal={:?}, initial_generation_input_text_equal={:?}, nested_tool_names_equal={:?}, nested_tool_definitions_equal={:?}",
         nanocodex.initial_model.as_deref().unwrap_or("unobserved"),
         nanocodex
             .initial_reasoning_effort
@@ -4034,6 +4081,12 @@ fn validate_matched_code_mode_only_profile(
             .as_deref()
             .unwrap_or("unobserved"),
         codex.initial_visible_tools.join(", "),
+        summary.event_loop.initial_input_text_sections_equal,
+        summary
+            .event_loop
+            .initial_generation_input_text_sections_equal,
+        summary.event_loop.initial_code_mode_tool_names_equal,
+        summary.event_loop.initial_code_mode_tool_definitions_equal,
     ))
 }
 
@@ -4183,6 +4236,20 @@ fn compare_api_exchanges(
             nanocodex.summary.model_visible_tool_sequence
                 == codex.summary.model_visible_tool_sequence
         });
+    let initial_input_text_sections_equal = nanocodex_event_loop
+        .as_ref()
+        .zip(codex_event_loop.as_ref())
+        .map(|(nanocodex, codex)| {
+            nanocodex.summary.initial_input_text_sections
+                == codex.summary.initial_input_text_sections
+        });
+    let initial_generation_input_text_sections_equal = nanocodex_event_loop
+        .as_ref()
+        .zip(codex_event_loop.as_ref())
+        .map(|(nanocodex, codex)| {
+            nanocodex.summary.initial_generation_input_text_sections
+                == codex.summary.initial_generation_input_text_sections
+        });
     let initial_code_mode_tool_names_equal = nanocodex_event_loop
         .as_ref()
         .zip(codex_event_loop.as_ref())
@@ -4216,6 +4283,8 @@ fn compare_api_exchanges(
         request_count_equal,
         chain_invariants_equal,
         model_visible_tool_sequence_equal,
+        initial_input_text_sections_equal,
+        initial_generation_input_text_sections_equal,
         initial_code_mode_tool_names_equal,
         initial_code_mode_tool_definitions_equal,
         aligned_turns: u64::try_from(aligned_request_count).unwrap_or(u64::MAX),
@@ -4285,6 +4354,8 @@ impl ApiEventLoopComparison {
             request_count_equal: None,
             chain_invariants_equal: None,
             model_visible_tool_sequence_equal: None,
+            initial_input_text_sections_equal: None,
+            initial_generation_input_text_sections_equal: None,
             initial_code_mode_tool_names_equal: None,
             initial_code_mode_tool_definitions_equal: None,
             aligned_turns: 0,
@@ -4394,6 +4465,22 @@ struct EventLoopNormalizeContext<'a> {
 }
 
 fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
+    let initial_input_text_sections = requests
+        .first()
+        .map_or_else(Vec::new, |request| input_text_sections(&request.payload));
+    let initial_generation_input_text_sections = requests
+        .iter()
+        .find(|request| request.phase.as_deref() == Some("generation"))
+        .or_else(|| {
+            requests.iter().find(|request| {
+                request
+                    .payload
+                    .get("generate")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+            })
+        })
+        .map_or_else(Vec::new, |request| input_text_sections(&request.payload));
     let initial_model = requests
         .first()
         .and_then(|request| request.payload.get("model"))
@@ -4593,6 +4680,8 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             initial_reasoning_effort,
             initial_reasoning_summary,
             initial_visible_tools,
+            initial_input_text_sections,
+            initial_generation_input_text_sections,
             initial_code_mode_tools,
             initial_code_mode_tool_definitions,
             detected_poll_only_turns,
@@ -4611,6 +4700,57 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             broken_tool_result_links,
         },
     }
+}
+
+fn input_text_sections(request: &serde_json::Value) -> Vec<ApiInputTextSectionSummary> {
+    request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(item_ordinal, item)| {
+            let role = item
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            item.get("content")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(move |(content_ordinal, content)| {
+                    if content.get("type").and_then(serde_json::Value::as_str) != Some("input_text")
+                    {
+                        return None;
+                    }
+                    let text = content.get("text").and_then(serde_json::Value::as_str)?;
+                    Some(ApiInputTextSectionSummary {
+                        item_ordinal: u64::try_from(item_ordinal).unwrap_or(u64::MAX),
+                        content_ordinal: u64::try_from(content_ordinal).unwrap_or(u64::MAX),
+                        role: role.clone(),
+                        label: input_text_label(text),
+                        text_bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+                        text_sha256: hex::encode(Sha256::digest(text.as_bytes())),
+                    })
+                })
+        })
+        .collect()
+}
+
+fn input_text_label(text: &str) -> String {
+    let text = text.trim_start();
+    if text.starts_with("# AGENTS.md instructions") {
+        return "agents_md".to_owned();
+    }
+    if let Some(tag) = text.strip_prefix('<').and_then(|text| {
+        let end = text.find(|character: char| character == '>' || character.is_whitespace())?;
+        (end > 0).then(|| &text[..end])
+    }) {
+        return tag.to_owned();
+    }
+    "plain_text".to_owned()
 }
 
 fn visible_tool_names(request: &serde_json::Value) -> Vec<String> {
@@ -5839,6 +5979,16 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            summary.event_loop.initial_input_text_sections_equal,
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .event_loop
+                .initial_generation_input_text_sections_equal,
+            Some(true)
+        );
+        assert_eq!(
             summary
                 .event_loop
                 .nanocodex
@@ -5878,7 +6028,7 @@ mod tests {
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 10);
+        assert_eq!(report["schema_version"], 11);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5995,6 +6145,55 @@ mod tests {
             left.summary.initial_code_mode_tool_definitions,
             right.summary.initial_code_mode_tool_definitions
         );
+    }
+
+    #[test]
+    fn event_loop_summary_fingerprints_initial_model_input_text() {
+        let mut left = event_loop_fixture("left-session", "left-cache", "left-response");
+        let mut right = event_loop_fixture("right-session", "right-cache", "right-response");
+        for requests in [&mut left, &mut right] {
+            requests[0].payload["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "<permissions instructions>\nfull access\n</permissions instructions>"
+                    }]
+                }));
+            requests[1].payload["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "<environment_context>\n  <shell>bash</shell>\n</environment_context>"
+                    }]
+                }));
+        }
+        right[1].payload["input"][1]["content"][0]["text"] =
+            serde_json::json!("<environment_context>\n  <shell>sh</shell>\n</environment_context>");
+
+        let left = build_event_loop_trace(&left);
+        let right = build_event_loop_trace(&right);
+
+        assert_eq!(
+            left.summary.initial_input_text_sections,
+            right.summary.initial_input_text_sections
+        );
+        assert_ne!(
+            left.summary.initial_generation_input_text_sections,
+            right.summary.initial_generation_input_text_sections
+        );
+        let section = &left.summary.initial_generation_input_text_sections[1];
+        assert_eq!(section.role, "user");
+        assert_eq!(section.label, "environment_context");
+        assert_eq!(section.item_ordinal, 1);
+        assert_eq!(section.content_ordinal, 0);
     }
 
     #[test]

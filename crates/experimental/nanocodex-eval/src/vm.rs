@@ -626,6 +626,7 @@ impl VmEnvironment {
     pub fn guest_environment(&self, task: &Task) -> BTreeMap<String, String> {
         let mut environment = self.environment.clone();
         environment.extend(base_guest_environment(task, &self.workspace));
+        environment.insert("SHELL".to_owned(), self.shell.clone());
         environment
     }
 }
@@ -2659,6 +2660,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(evaluator.attempt_environment(), EvalEnvironment::MicroVm);
+    }
+
+    #[test]
+    fn guest_environment_exposes_the_selected_shell() {
+        let task =
+            Task::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../tasks/write-greeting"))
+                .unwrap();
+        let environment = VmEnvironment::new("rootfs.ext4", "/app", "bash")
+            .environment([("SHELL".to_owned(), "sh".to_owned())]);
+
+        assert_eq!(environment.guest_environment(&task)["SHELL"], "bash");
     }
 
     #[test]
