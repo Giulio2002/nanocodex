@@ -24,7 +24,13 @@ pub(crate) struct Diff {
     #[arg(
         long,
         value_name = "COMPARISON_DIRECTORY",
-        conflicts_with_all = ["task", "codex_bin", "vm_guest_runtime", "vm_refresh"]
+        conflicts_with_all = [
+            "task",
+            "codex_bin",
+            "vm_cache",
+            "vm_guest_runtime",
+            "vm_refresh"
+        ]
     )]
     reanalyze: Option<PathBuf>,
 
@@ -55,6 +61,10 @@ pub(crate) struct Diff {
     /// Use this prebuilt Nanocodex guest-runtime ELF.
     #[arg(long, value_name = "ELF")]
     vm_guest_runtime: Option<PathBuf>,
+
+    /// Content-addressed VM cache shared across differential runs.
+    #[arg(long, value_name = "DIRECTORY", default_value = ".cache/vm")]
+    vm_cache: PathBuf,
 
     /// Resolve the task image at the registry instead of reusing its local resolution.
     #[arg(long)]
@@ -98,9 +108,11 @@ impl Diff {
         };
         let current_executable = std::env::current_exe()?;
         let runtime_image =
-            run::prepare_vm_guest_runtime_from(self.vm_guest_runtime.as_deref()).await?;
+            run::prepare_vm_guest_runtime_from(self.vm_guest_runtime.as_deref(), &self.vm_cache)
+                .await?;
         let vm = VmResources::builder(&current_executable, runtime_image)
             .task(task.clone())
+            .cache_directory(&self.vm_cache)
             .cache_policy(if self.vm_refresh {
                 CachePolicy::Refresh
             } else {

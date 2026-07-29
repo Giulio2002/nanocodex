@@ -804,7 +804,14 @@ mod tests {
     #[test]
     fn complete_eval_surface_is_nested_under_nanocodex() {
         for arguments in [
-            vec!["nanocodex", "eval", "--task", "tasks/write-greeting"],
+            vec![
+                "nanocodex",
+                "eval",
+                "--task",
+                "tasks/write-greeting",
+                "--vm-cache",
+                "/var/cache/nanocodex-vm",
+            ],
             vec![
                 "nanocodex",
                 "eval",
@@ -827,6 +834,8 @@ mod tests {
                 "tasks/write-greeting",
                 "--codex-bin",
                 "/tmp/codex",
+                "--vm-cache",
+                "/var/cache/nanocodex-vm",
                 "--thinking",
                 "medium",
             ],

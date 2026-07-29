@@ -100,6 +100,10 @@ pub(crate) struct Run {
     #[arg(long, value_name = "ELF")]
     vm_guest_runtime: Option<PathBuf>,
 
+    /// Content-addressed VM cache shared across evaluation jobs.
+    #[arg(long, value_name = "DIRECTORY", default_value = ".cache/vm")]
+    vm_cache: PathBuf,
+
     /// Resolve the task image at the registry instead of reusing its local resolution.
     #[arg(long, conflicts_with = "vm_rootfs")]
     vm_refresh: bool,
@@ -165,6 +169,7 @@ struct ResolvedRun {
     max_memory_mb: Option<u64>,
     vm_rootfs: Option<PathBuf>,
     vm_guest_runtime: Option<PathBuf>,
+    vm_cache: PathBuf,
     vm_retention: VmRetention,
     thinking: Thinking,
     web_search: bool,
@@ -470,6 +475,7 @@ impl Run {
             max_memory_mb: scheduling.max_memory_mb,
             vm_rootfs,
             vm_guest_runtime,
+            vm_cache: self.vm_cache.clone(),
             vm_retention: self
                 .vm_retention
                 .or_else(|| {
@@ -538,6 +544,7 @@ impl Run {
         let vm_environments_started = Instant::now();
         let mut resources = VmResources::builder(vmm, runtime_image)
             .tasks(tasks.clone())
+            .cache_directory(&resolved.vm_cache)
             .cache_policy(if self.vm_refresh {
                 CachePolicy::Refresh
             } else {
@@ -811,6 +818,7 @@ impl ResolvedRun {
         if let Some(runtime) = &self.vm_guest_runtime {
             eprintln!("VM guest runtime: pinned prebuilt {}", runtime.display());
         }
+        eprintln!("VM cache: {}", self.vm_cache.display());
     }
 
     fn report_automatic_scheduling(&self) {
@@ -1975,17 +1983,20 @@ compile_error!("Evaluator VM guests are only supported on aarch64 and x86_64 hos
 const VM_GUEST_BUILD_RECORD_VERSION: u32 = 1;
 
 pub(crate) async fn prepare_vm_guest_runtime() -> Result<PathBuf> {
-    prepare_vm_guest_runtime_from(None).await
+    prepare_vm_guest_runtime_from(None, Path::new(DEFAULT_VM_CACHE)).await
 }
 
-pub(crate) async fn prepare_vm_guest_runtime_from(prebuilt: Option<&Path>) -> Result<PathBuf> {
+pub(crate) async fn prepare_vm_guest_runtime_from(
+    prebuilt: Option<&Path>,
+    cache: &Path,
+) -> Result<PathBuf> {
     let started_at = Instant::now();
     let environment_prebuilt = std::env::var_os("NANOCODEX_VM_GUEST_RUNTIME").map(PathBuf::from);
     let prebuilt = prebuilt.or(environment_prebuilt.as_deref());
     let source = resolve_vm_guest_runtime_source(prebuilt).await?;
     let (bytes, _) = stable_file_bytes(&source.path)?;
     validate_vm_guest_elf(&bytes, &source.path)?;
-    let runtime_disk = GuestRuntimeDisk::prepare(&source.path, Path::new(DEFAULT_VM_CACHE))?;
+    let runtime_disk = GuestRuntimeDisk::prepare(&source.path, cache)?;
     record_guest_runtime_ready(
         started_at,
         source.build_status,
@@ -3525,6 +3536,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_vm_cache_is_an_explicit_eval_resource() {
+        let cli = TestCli::try_parse_from([
+            "nanoeval",
+            "--task",
+            "tasks/first",
+            "--vm-cache",
+            "/var/cache/nanocodex-vm",
+        ])
+        .unwrap();
+
+        let resolved = cli.eval.resolve_run().unwrap();
+
+        assert_eq!(resolved.vm_cache, PathBuf::from("/var/cache/nanocodex-vm"));
+    }
+
     #[tokio::test]
     async fn explicit_guest_runtime_rejects_the_wrong_elf_machine() {
         let job = tempfile::tempdir().unwrap();
@@ -3596,6 +3623,7 @@ mod tests {
             max_memory_mb: None,
             vm_rootfs: None,
             vm_guest_runtime: Some(source.clone()),
+            vm_cache: PathBuf::from(".cache/vm"),
             vm_retention: VmRetention::Failures,
             thinking: Thinking::Low,
             web_search: false,

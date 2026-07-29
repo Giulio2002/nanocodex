@@ -317,7 +317,11 @@ impl VmImageBuilder {
             .to_owned();
         let (vmm_digest, runtime_digest, firmware_digest) =
             if let Some(directory) = &self.firmware_directory {
-                let firmware = directory.join(FIRMWARE_LIBRARY_FILENAME);
+                // Versioned libkrunfw installations expose the ABI filename as
+                // a symlink to the immutable versioned library. Hash the
+                // resolved regular file while retaining the configured
+                // directory for the dynamic loader.
+                let firmware = directory.join(FIRMWARE_LIBRARY_FILENAME).canonicalize()?;
                 let (vmm_digest, runtime_digest, firmware_digest) = tokio::try_join!(
                     cached_file_digest(&self.vmm, &self.vmm_digest),
                     cached_file_digest(&self.runtime_image, &self.runtime_digest),
@@ -2989,6 +2993,38 @@ mod tests {
         assert_eq!(
             configured.as_deref(),
             Some(directory.path().canonicalize().unwrap().as_os_str())
+        );
+    }
+
+    #[test]
+    fn build_cache_hashes_a_versioned_firmware_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let vmm = directory.path().join("vmm");
+        let runtime_image = directory.path().join("runtime.ext4");
+        let versioned_firmware = directory.path().join("libkrunfw-versioned");
+        fs::write(&vmm, b"vmm").unwrap();
+        fs::write(&runtime_image, b"runtime").unwrap();
+        fs::write(&versioned_firmware, b"firmware").unwrap();
+        std::os::unix::fs::symlink(
+            versioned_firmware.file_name().unwrap(),
+            directory.path().join(FIRMWARE_LIBRARY_FILENAME),
+        )
+        .unwrap();
+        let builder = VmImageBuilder::new(&vmm, &runtime_image)
+            .firmware_directory(directory.path())
+            .egress(EgressLease::disabled());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let inputs = runtime
+            .block_on(builder.build_cache_inputs())
+            .expect("versioned firmware symlink should be a valid runtime input");
+
+        assert_eq!(
+            inputs.firmware_digest,
+            super::sha256_file(&versioned_firmware).unwrap()
         );
     }
 
