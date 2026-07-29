@@ -116,7 +116,7 @@ const TRAJECTORY_FILE: &str = "agent/trajectory.json";
 const API_EXCHANGES_FILE: &str = "agent/api-exchanges.jsonl";
 const API_COMPARISON_FILE: &str = "api-comparison.json";
 const API_CAPTURE_SCHEMA_VERSION: u32 = 1;
-const API_COMPARISON_SCHEMA_VERSION: u32 = 5;
+const API_COMPARISON_SCHEMA_VERSION: u32 = 6;
 const DIFF_CODEX_SHARE_TAG: &str = "nanoeval-codex";
 const DIFF_CODEX_SHARE_MOUNT: &str = "/run/nanoeval-codex";
 const DIFF_CODEX_GUEST_BINARY: &str = "/run/nanoeval-codex/codex";
@@ -582,12 +582,14 @@ struct ApiEventLoopComparison {
     request_count_equal: Option<bool>,
     chain_invariants_equal: Option<bool>,
     model_visible_tool_sequence_equal: Option<bool>,
+    initial_code_mode_tool_catalog_equal: Option<bool>,
     aligned_turns: u64,
     nanocodex_unpaired_turns: u64,
     codex_unpaired_turns: u64,
     equal_turns: u64,
     differing_turns: u64,
     first_divergence: Option<ApiEventLoopFirstDivergence>,
+    first_generation_divergence: Option<ApiEventLoopFirstDivergence>,
     nanocodex: Option<ApiEventLoopArmSummary>,
     codex: Option<ApiEventLoopArmSummary>,
 }
@@ -611,6 +613,7 @@ struct ApiEventLoopArmSummary {
     initial_reasoning_effort: Option<String>,
     initial_reasoning_summary: Option<String>,
     initial_visible_tools: Vec<String>,
+    initial_code_mode_tools: Option<Vec<String>>,
     detected_poll_only_turns: u64,
     max_consecutive_detected_poll_only_turns: u64,
     detected_empty_stdin_calls: u64,
@@ -853,6 +856,42 @@ impl DiffProgress {
             kind,
             summarize_nanocodex(&event.kind, &payload),
         );
+    }
+
+    fn observe_evaluator(&self, arm: &'static str, event: &EvalEventKind) {
+        match event {
+            EvalEventKind::VerifierStarted => {
+                self.emit(arm, "verifier.started", "canonical verifier");
+            }
+            EvalEventKind::VerifierOutput { stdout, stderr } => {
+                self.emit(
+                    arm,
+                    "verifier.output",
+                    format!(
+                        "{} stdout bytes · {} stderr bytes",
+                        stdout.len(),
+                        stderr.len()
+                    ),
+                );
+            }
+            EvalEventKind::VerifierCompleted(result) => {
+                let rewards = result
+                    .rewards
+                    .iter()
+                    .map(|(name, reward)| format!("{name}={reward}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.emit(
+                    arm,
+                    "verifier.completed",
+                    format!("exit {} · {rewards}", result.exit_code),
+                );
+            }
+            EvalEventKind::AttemptStarted { .. }
+            | EvalEventKind::Agent(_)
+            | EvalEventKind::Completed(_)
+            | EvalEventKind::Failed(_) => {}
+        }
     }
 
     fn observe_nanocodex_api(&self, payload: &serde_json::Value) {
@@ -2486,6 +2525,7 @@ impl DifferentialReport {
         append_arm_summary(&mut output, "nanocodex", &self.nanocodex);
         append_arm_summary(&mut output, "codex", &self.codex);
         append_model_visible_tool_summary(&mut output, &self.api_comparison.event_loop);
+        append_first_generation_divergence(&mut output, &self.api_comparison.event_loop);
         let _ = writeln!(
             output,
             "live progress: {}",
@@ -3075,6 +3115,7 @@ async fn record_events(
     let mut atif = AtifBuilder::default();
     let mut atif_error = None;
     while let Some(event) = stream.recv().await? {
+        progress.observe_evaluator(arm_name, &event.kind);
         if let EvalEventKind::Agent(agent_event) = &event.kind {
             let payload = serde_json::from_str(agent_event.payload.get()).unwrap_or_default();
             if matches!(agent_event.kind, AgentEventKind::ApiEvent) && arm_name == "nanocodex" {
@@ -3630,6 +3671,7 @@ fn reanalyze_inner(path: &Path) -> InternalResult<DifferentialReanalysis> {
                 divergence.pointer
             );
         }
+        append_first_generation_divergence(&mut human_summary, &summary.event_loop);
         append_event_loop_arm_summary(
             &mut human_summary,
             "nanocodex",
@@ -3764,6 +3806,34 @@ fn append_model_visible_tool_summary(output: &mut String, comparison: &ApiEventL
             .model_visible_tool_sequence_equal
             .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
     );
+    let format_code_mode_tools = |tools: Option<&[String]>| {
+        tools.map_or_else(
+            || "unavailable".to_owned(),
+            |tools| format!("[{}]", tools.join(", ")),
+        )
+    };
+    let _ = writeln!(
+        output,
+        "nested Code Mode tool catalog: nanocodex {} · codex {} · match {}",
+        format_code_mode_tools(nanocodex.initial_code_mode_tools.as_deref()),
+        format_code_mode_tools(codex.initial_code_mode_tools.as_deref()),
+        comparison
+            .initial_code_mode_tool_catalog_equal
+            .map_or("unavailable", |equal| if equal { "yes" } else { "no" }),
+    );
+}
+
+fn append_first_generation_divergence(output: &mut String, comparison: &ApiEventLoopComparison) {
+    let Some(divergence) = &comparison.first_generation_divergence else {
+        return;
+    };
+    let _ = writeln!(
+        output,
+        "first generation divergence: turn {} · {} · {}",
+        divergence.request_index,
+        divergence.categories.join(","),
+        divergence.pointer,
+    );
 }
 
 fn retain_api_comparison(
@@ -3860,6 +3930,7 @@ fn compare_api_exchanges(
     let mut equal_requests = 0_u64;
     let mut differing_requests = 0_u64;
     let mut first_event_loop_divergence = None;
+    let mut first_generation_divergence = None;
     let mut equal_event_loop_turns = 0_u64;
     let mut differing_event_loop_turns = 0_u64;
     for offset in 0..request_count {
@@ -3929,6 +4000,23 @@ fn compare_api_exchanges(
                 categories: event_loop_categories.clone(),
             });
         }
+        let generation_turn = [nanocodex, codex].into_iter().flatten().any(|request| {
+            request.phase.as_deref() == Some("generation")
+                || request
+                    .payload
+                    .get("generate")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+        });
+        if !event_loop_equal && generation_turn && first_generation_divergence.is_none() {
+            first_generation_divergence = Some(ApiEventLoopFirstDivergence {
+                request_index,
+                pointer: event_loop_differences
+                    .first()
+                    .map_or_else(String::new, |difference| difference.pointer.clone()),
+                categories: event_loop_categories.clone(),
+            });
+        }
         requests.push(ApiRequestComparison {
             request_index,
             nanocodex_request_index: nanocodex.map(|request| request.request_index),
@@ -3959,11 +4047,23 @@ fn compare_api_exchanges(
             nanocodex.summary.model_visible_tool_sequence
                 == codex.summary.model_visible_tool_sequence
         });
+    let initial_code_mode_tool_catalog_equal = nanocodex_event_loop
+        .as_ref()
+        .zip(codex_event_loop.as_ref())
+        .and_then(|(nanocodex, codex)| {
+            nanocodex
+                .summary
+                .initial_code_mode_tools
+                .as_ref()
+                .zip(codex.summary.initial_code_mode_tools.as_ref())
+                .map(|(nanocodex, codex)| nanocodex == codex)
+        });
     let event_loop = ApiEventLoopComparison {
         comparable,
         request_count_equal,
         chain_invariants_equal,
         model_visible_tool_sequence_equal,
+        initial_code_mode_tool_catalog_equal,
         aligned_turns: u64::try_from(aligned_request_count).unwrap_or(u64::MAX),
         nanocodex_unpaired_turns: u64::try_from(nanocodex_unpaired_request_count)
             .unwrap_or(u64::MAX),
@@ -3971,6 +4071,7 @@ fn compare_api_exchanges(
         equal_turns: equal_event_loop_turns,
         differing_turns: differing_event_loop_turns,
         first_divergence: first_event_loop_divergence,
+        first_generation_divergence,
         nanocodex: nanocodex_event_loop.map(|trace| trace.summary),
         codex: codex_event_loop.map(|trace| trace.summary),
     };
@@ -4028,12 +4129,14 @@ impl ApiEventLoopComparison {
             request_count_equal: None,
             chain_invariants_equal: None,
             model_visible_tool_sequence_equal: None,
+            initial_code_mode_tool_catalog_equal: None,
             aligned_turns: 0,
             nanocodex_unpaired_turns: 0,
             codex_unpaired_turns: 0,
             equal_turns: 0,
             differing_turns: 0,
             first_divergence: None,
+            first_generation_divergence: None,
             nanocodex: None,
             codex: None,
         }
@@ -4149,6 +4252,9 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
     let initial_visible_tools = requests
         .first()
         .map_or_else(Vec::new, |request| visible_tool_names(&request.payload));
+    let initial_code_mode_tools = requests
+        .first()
+        .and_then(|request| code_mode_tool_names(&request.payload));
     let first_prompt_cache_key = requests
         .first()
         .and_then(|request| request.payload.get("prompt_cache_key"))
@@ -4287,6 +4393,7 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
             initial_reasoning_effort,
             initial_reasoning_summary,
             initial_visible_tools,
+            initial_code_mode_tools,
             detected_poll_only_turns,
             max_consecutive_detected_poll_only_turns,
             detected_empty_stdin_calls,
@@ -4303,31 +4410,49 @@ fn build_event_loop_trace(requests: &[ApiRequestPayload]) -> ApiEventLoopTrace {
 }
 
 fn visible_tool_names(request: &serde_json::Value) -> Vec<String> {
-    let mut names = request
+    visible_tools(request)
+        .filter_map(visible_tool_name)
+        .collect::<Vec<_>>()
+}
+
+fn visible_tools(request: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    request
         .get("tools")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(visible_tool_name)
+        .chain(
+            request
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
+                })
+                .flat_map(|item| {
+                    item.get("tools")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                }),
+        )
+}
+
+fn code_mode_tool_names(request: &serde_json::Value) -> Option<Vec<String>> {
+    let description = visible_tools(request)
+        .find(|tool| visible_tool_name(tool).as_deref() == Some("exec"))?
+        .get("description")
+        .and_then(serde_json::Value::as_str)?;
+    let names = description
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("### `")
+                .and_then(|name| name.strip_suffix('`'))
+                .map(str::to_owned)
+        })
         .collect::<Vec<_>>();
-    names.extend(
-        request
-            .get("input")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools")
-            })
-            .flat_map(|item| {
-                item.get("tools")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-            })
-            .filter_map(visible_tool_name),
-    );
-    names
+    (!names.is_empty()).then_some(names)
 }
 
 fn visible_tool_name(tool: &serde_json::Value) -> Option<String> {
@@ -4865,7 +4990,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        AgentStatus, AtifStep, AtifTrajectory, AttemptAgent, EvalAttemptOutcome, EvalStatus,
+        AgentStatus, AtifStep, AtifTrajectory, AttemptAgent, EvalAttemptOutcome, EvalEventKind,
+        EvalStatus, VerifierResult,
     };
 
     use super::{
@@ -5050,6 +5176,35 @@ mod tests {
         let summary = heartbeat["summary"].as_str().unwrap();
         assert!(summary.contains("nanocodex: model.call.started (call 8)"));
         assert!(summary.contains("codex: item.started (command_execution · apt-get)"));
+    }
+
+    #[tokio::test]
+    async fn progress_lane_moves_from_agent_completion_into_verifier_work() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("progress.jsonl");
+        let (progress, recorder) = DiffProgress::start(path.clone(), tokio::time::Instant::now())
+            .await
+            .unwrap();
+        progress.emit("nanocodex", "run.completed", "model calls 9");
+        progress.observe_evaluator("nanocodex", &EvalEventKind::VerifierStarted);
+        progress.observe_evaluator(
+            "nanocodex",
+            &EvalEventKind::VerifierCompleted(VerifierResult {
+                exit_code: 0,
+                rewards: [("task_reward".to_owned(), 1.0)].into(),
+            }),
+        );
+        recorder.finish(progress).await.unwrap();
+
+        let records = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[1]["kind"], "verifier.started");
+        assert_eq!(records[1]["summary"], "canonical verifier");
+        assert_eq!(records[2]["kind"], "verifier.completed");
+        assert_eq!(records[2]["summary"], "exit 0 · task_reward=1");
     }
 
     #[tokio::test]
@@ -5277,7 +5432,11 @@ mod tests {
                         "input": [{
                             "type": "additional_tools",
                             "tools": [
-                                {"type": "custom", "name": "exec"},
+                                {
+                                    "type": "custom",
+                                    "name": "exec",
+                                    "description": "execute code\n\n### `exec_command`\nRun a command.\n\n### `write_stdin`\nWrite input."
+                                },
                                 {"type": "function", "name": "wait"}
                             ]
                         }]
@@ -5308,6 +5467,10 @@ mod tests {
         assert_eq!(summary.event_loop.nanocodex_unpaired_turns, 0);
         assert_eq!(summary.event_loop.codex_unpaired_turns, 1);
         assert_eq!(
+            summary.event_loop.initial_code_mode_tool_catalog_equal,
+            Some(true)
+        );
+        assert_eq!(
             summary
                 .event_loop
                 .nanocodex
@@ -5336,10 +5499,18 @@ mod tests {
                 .map(|divergence| divergence.request_index),
             Some(2)
         );
+        assert_eq!(
+            summary
+                .event_loop
+                .first_generation_divergence
+                .as_ref()
+                .map(|divergence| divergence.request_index),
+            Some(2)
+        );
 
         let report: serde_json::Value =
             serde_json::from_reader(fs::File::open(report_path).unwrap()).unwrap();
-        assert_eq!(report["schema_version"], 5);
+        assert_eq!(report["schema_version"], 6);
         assert_eq!(report["aligned_requests"], 1);
         assert_eq!(report["codex_unpaired_requests"], 1);
         assert_eq!(report["equal_requests"], 1);
@@ -5391,6 +5562,34 @@ mod tests {
         assert_eq!(
             left.summary.model_visible_tool_sequence,
             right.summary.model_visible_tool_sequence
+        );
+    }
+
+    #[test]
+    fn event_loop_summary_extracts_nested_code_mode_tool_catalog_in_order() {
+        let mut left = event_loop_fixture("left-session", "left-cache", "left-response");
+        let mut right = event_loop_fixture("right-session", "right-cache", "right-response");
+        left[0].payload["input"][0]["tools"][0]["description"] = serde_json::json!(
+            "execute code\n\n### `exec_command`\nRun a command.\n\n### `view_image`\nView an image."
+        );
+        right[0].payload["input"][0]["tools"][0]["description"] = serde_json::json!(
+            "execute code\n\n### `exec_command`\nRun a command.\n\n### `write_stdin`\nWrite input."
+        );
+
+        let left = build_event_loop_trace(&left);
+        let right = build_event_loop_trace(&right);
+
+        assert_eq!(
+            left.summary.initial_code_mode_tools.as_deref(),
+            Some(["exec_command".to_owned(), "view_image".to_owned()].as_slice())
+        );
+        assert_eq!(
+            right.summary.initial_code_mode_tools.as_deref(),
+            Some(["exec_command".to_owned(), "write_stdin".to_owned()].as_slice())
+        );
+        assert_ne!(
+            left.summary.initial_code_mode_tools,
+            right.summary.initial_code_mode_tools
         );
     }
 
@@ -5748,7 +5947,7 @@ printf '%s\n' 'fake diagnostic' >&2
                         "tools": [{
                             "type": "custom",
                             "name": "exec",
-                            "description": "execute code"
+                            "description": "execute code\n\n### `exec_command`\nRun a command.\n\n### `write_stdin`\nWrite input."
                         }]
                     }]
                 }),
