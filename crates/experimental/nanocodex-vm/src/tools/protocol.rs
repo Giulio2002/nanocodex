@@ -110,6 +110,10 @@ pub(crate) struct ExecuteRequest {
     pub environment: Vec<(String, String)>,
     pub timeout_millis: u64,
     pub max_output_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_mirror: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_mirror: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -396,6 +400,8 @@ mod tests {
             environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
             timeout_millis: 60_000,
             max_output_bytes: 8_388_608,
+            stdout_mirror: None,
+            stderr_mirror: None,
         });
         assert_eq!(
             serde_json::to_string(&execute).unwrap(),

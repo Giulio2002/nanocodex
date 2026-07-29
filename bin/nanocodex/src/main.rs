@@ -2,6 +2,7 @@ mod auth;
 mod config;
 #[cfg(feature = "tempo")]
 mod credits;
+mod eval;
 mod mcp;
 #[cfg_attr(not(feature = "tempo"), path = "mpp_disabled.rs")]
 mod mpp;
@@ -55,6 +56,8 @@ enum Command {
     /// Inspect or purchase Nanocodex NANOUSD credits.
     #[cfg(feature = "tempo")]
     Credits(credits::Credits),
+    /// Run and inspect durable native agent evaluations.
+    Eval(eval::Eval),
     /// Internal entrypoint for one dedicated libkrun VMM process.
     #[command(hide = true)]
     VmRunConfig(vm::VmRunConfig),
@@ -110,6 +113,11 @@ fn main() -> Result<()> {
     if let Some(Command::VmRunConfig(command)) = &cli.command {
         return command.run();
     }
+    if let Some(Command::Eval(command)) = &cli.command
+        && command.requires_synchronous_vm()
+    {
+        return command.run_synchronous_vm();
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -121,6 +129,7 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Command::Auth(command)) => command.run().await,
         #[cfg(feature = "tempo")]
         Some(Command::Credits(command)) => command.run().await,
+        Some(Command::Eval(command)) => command.run().await,
         Some(Command::VmRunConfig(_)) => unreachable!("VMM commands run before Tokio starts"),
         Some(Command::Run(command)) => {
             let _observability = command.observability.install(false, command.agent.cwd())?;

@@ -1646,8 +1646,6 @@ struct RetainedAgentMetadata {
     #[serde(default)]
     warmup_usage: Option<UsageTotals>,
     #[serde(default)]
-    pricing_revision: Option<String>,
-    #[serde(default)]
     estimated_cost: Option<EstimatedUsdCost>,
     #[serde(default)]
     cost_status: Option<String>,
@@ -1892,7 +1890,6 @@ impl DurableHarborTrial {
             runtime,
             cost_usd: agent.and_then(|agent| agent.cost_usd),
             estimated_cost: metadata.and_then(|metadata| metadata.estimated_cost.clone()),
-            pricing_revision: metadata.and_then(|metadata| metadata.pricing_revision.clone()),
             billing_completeness: agent.map(|agent| {
                 agent
                     .billing_completeness
@@ -2671,10 +2668,6 @@ mod tests {
         assert_eq!(usage.combined.cache_write_input_tokens, 2);
         assert_eq!(usage.combined.output_tokens, 3);
         assert_eq!(usage.combined.reasoning_output_tokens, 1);
-        assert_eq!(
-            aggregate.attempts[0].pricing_revision.as_deref(),
-            Some("test-pricing-v1")
-        );
         assert_eq!(
             aggregate.attempts[0]
                 .estimated_cost
@@ -3736,7 +3729,6 @@ allow_internet = false
                         "reasoning_output_tokens": 0,
                         "total_tokens": 2,
                     },
-                    "pricing_revision": "test-pricing-v1",
                     "estimated_cost": {
                         "usd": "0.25",
                         "input_usd": "0.1",

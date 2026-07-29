@@ -31,29 +31,37 @@ tempo = [
 
 [dependencies]
 arboard.workspace = true
+arcbox-ext4.workspace = true
 async-trait.workspace = true
 alloy-primitives = { workspace = true, optional = true }
 base64.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
+flate2.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 http-body-util = { workspace = true, optional = true }
 hudsucker = { workspace = true, optional = true }
+ignore.workspace = true
 image.workspace = true
 nanocodex.workspace = true
+nanocodex-eval.workspace = true
 nanocodex-observability.workspace = true
 nanocodex-vm.workspace = true
 nix = { workspace = true, optional = true }
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
 mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
+oci-client.workspace = true
 rand = { workspace = true, optional = true }
 ratatui.workspace = true
+reflink-copy.workspace = true
 reqwest = { workspace = true, features = ["blocking", "stream"] }
+regex.workspace = true
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -62,6 +70,8 @@ syntect.workspace = true
 two-face.workspace = true
 sha2.workspace = true
 shlex.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
@@ -70,6 +80,10 @@ tempo-alloy = { workspace = true, optional = true }
 tracing.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+url.workspace = true
+uuid.workspace = true
+yansi.workspace = true
+zstd.workspace = true
 
 [build-dependencies]
 chrono.workspace = true
@@ -79,6 +93,7 @@ vergen = { workspace = true, features = ["build", "git", "gitcl"] }
 axum.workspace = true
 criterion.workspace = true
 nanocodex-tools.workspace = true
+nix.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true

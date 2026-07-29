@@ -19,14 +19,13 @@ use std::{
 use clap::{Args, Subcommand};
 use eyre::{Result, eyre};
 use nanocodex_eval::{Task, VerifierCollect, VerifierEnvironmentMode};
-use nanocodex_vm::image::{CachePolicy, DiskStatus, VmImageBuilder};
-use nanocodex_vm::{
+use nanocodex_vm::host::{
     BlockDevice, GuestCommand, KrunVm, Network, SharedDirectory, VmConfig, VmProcessConfig,
 };
+use nanocodex_vm::image::{CachePolicy, DiskStatus, VmImageBuilder};
 use serde::Serialize;
 
 use self::image::{prepare_task_image, prepare_verifier_image};
-pub(crate) use self::run::prepare_vm_guest_runtime;
 
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]

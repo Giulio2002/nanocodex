@@ -56,6 +56,7 @@ const AGENT_CANCELLATION_GRACE: Duration = Duration::from_secs(10);
 // One warmup plus three typical four-call attempts stays below the provider's
 // approximate 15-request-per-minute routing guidance for a cache key.
 const PROMPT_CACHE_COHORT_SIZE: u64 = 3;
+const ESTIMATED_LOWER_BOUND_COST_STATUS: &str = "estimated_lower_bound";
 
 /// A reusable evaluation recipe. Every task call creates an independent agent
 /// session and disposable workspace.
@@ -1534,13 +1535,7 @@ struct CompletedBillableOperations {
     response_retries: u32,
     model_duration_ns: u64,
     warmup_duration_ns: u64,
-    cost_nano_usd: u64,
-    priced_operations: u32,
-    estimated_cost: Option<nanocodex_agent::EstimatedUsdCost>,
-    estimated_cost_mixed_service_tier: bool,
     completed_responses: u32,
-    pricing_revision: Option<String>,
-    pricing_revision_unknown_or_mixed: bool,
 }
 
 struct AttemptRunFailure {
@@ -1824,16 +1819,11 @@ impl AgentObservation {
                     .warmup_duration_ns
                     .saturating_add(completed.duration_ns);
                 if completed.source == "response" {
-                    if completed.cost_status != CostStatus::EstimatedFromUsage {
+                    if completed.usage.is_none() {
                         self.billing_unknown = true;
                     }
-                    self.completed.observe(
-                        completed.usage.as_ref(),
-                        completed.estimated_cost.as_ref(),
-                        completed.pricing_revision.as_deref(),
-                        true,
-                        completed.attempt,
-                    );
+                    self.completed
+                        .observe(completed.usage.as_ref(), true, completed.attempt);
                 }
             }
             AgentEventKind::ModelWarmupFailed => {
@@ -1845,7 +1835,7 @@ impl AgentObservation {
             }
             AgentEventKind::ModelCallCompleted => {
                 let completed: ModelCallCompleted = event.decode_payload()?;
-                if completed.cost_status != CostStatus::EstimatedFromUsage {
+                if completed.usage.is_none() {
                     self.billing_unknown = true;
                 }
                 self.completed.model_calls = self.completed.model_calls.saturating_add(1);
@@ -1857,13 +1847,8 @@ impl AgentObservation {
                     .completed
                     .model_duration_ns
                     .saturating_add(completed.duration_ns);
-                self.completed.observe(
-                    completed.usage.as_ref(),
-                    completed.estimated_cost.as_ref(),
-                    completed.pricing_revision.as_deref(),
-                    false,
-                    Some(completed.attempt),
-                );
+                self.completed
+                    .observe(completed.usage.as_ref(), false, Some(completed.attempt));
             }
             AgentEventKind::ModelCallFailed => {
                 let failed: ModelCallFailed = event.decode_payload()?;
@@ -1874,7 +1859,7 @@ impl AgentObservation {
             }
             AgentEventKind::ModelCompactionCompleted => {
                 let completed: CompactionCompleted = event.decode_payload()?;
-                if completed.cost_status != CostStatus::EstimatedFromUsage {
+                if completed.usage.is_none() {
                     self.billing_unknown = true;
                 }
                 self.completed.compactions = self.completed.compactions.saturating_add(1);
@@ -1882,13 +1867,8 @@ impl AgentObservation {
                     .completed
                     .model_duration_ns
                     .saturating_add(completed.duration_ns);
-                self.completed.observe(
-                    completed.usage.as_ref(),
-                    completed.estimated_cost.as_ref(),
-                    completed.pricing_revision.as_deref(),
-                    false,
-                    Some(completed.attempt),
-                );
+                self.completed
+                    .observe(completed.usage.as_ref(), false, Some(completed.attempt));
             }
             AgentEventKind::ModelCompactionFailed => {
                 let failed: CompactionFailed = event.decode_payload()?;
@@ -1947,15 +1927,7 @@ impl AgentObservation {
         let run = self.run.as_ref();
         let model = run.map_or_else(|| MODEL.to_owned(), |run| run.model.clone());
         let effort = run.map_or_else(String::new, |run| run.effort.clone());
-        let cost_usd = (self.completed.priced_operations > 0).then(|| {
-            nanocodex_agent::UsdAmount::from_nano_usd(self.completed.cost_nano_usd).as_f64()
-        });
-        let pricing_revision = (!self.completed.pricing_revision_unknown_or_mixed)
-            .then(|| self.completed.pricing_revision.clone())
-            .flatten();
-        let estimated_cost = (!self.completed.estimated_cost_mixed_service_tier)
-            .then(|| self.completed.estimated_cost.clone())
-            .flatten();
+        let cost_usd = None;
         let model_calls = self.model_calls_started.max(self.completed.model_calls);
         let compactions = self.compactions_started.max(self.completed.compactions);
         let tool_calls = self.tool_calls_started.max(self.completed.tool_calls);
@@ -1994,13 +1966,8 @@ impl AgentObservation {
             warmup_usage: self.completed.warmup_usage.clone(),
             _last_response_id: None,
             cost_usd,
-            cost_status: if cost_usd.is_some() {
-                CostStatus::EstimatedLowerBound.as_str().to_owned()
-            } else {
-                CostStatus::UsageNotReported.as_str().to_owned()
-            },
-            pricing_revision,
-            estimated_cost,
+            cost_status: CostStatus::UsageNotReported.as_str().to_owned(),
+            estimated_cost: None,
         };
         Some(AgentResult {
             final_message: self.final_message.clone(),
@@ -2038,14 +2005,7 @@ impl AgentObservation {
 }
 
 impl CompletedBillableOperations {
-    fn observe(
-        &mut self,
-        usage: Option<&Usage>,
-        estimated_cost: Option<&nanocodex_agent::EstimatedUsdCost>,
-        pricing_revision: Option<&str>,
-        warmup: bool,
-        attempt: Option<u32>,
-    ) {
+    fn observe(&mut self, usage: Option<&Usage>, warmup: bool, attempt: Option<u32>) {
         self.completed_responses = self.completed_responses.saturating_add(1);
         if let Some(attempt) = attempt {
             self.response_attempts = self.response_attempts.saturating_add(attempt);
@@ -2059,29 +2019,6 @@ impl CompletedBillableOperations {
             } else {
                 self.usage.add(usage);
             }
-        }
-        if let Some(cost) = estimated_cost {
-            self.priced_operations = self.priced_operations.saturating_add(1);
-            self.cost_nano_usd = self.cost_nano_usd.saturating_add(cost.amount().nano_usd());
-            if !self.estimated_cost_mixed_service_tier {
-                self.estimated_cost = match self.estimated_cost.take() {
-                    Some(existing) => match existing.combined(cost) {
-                        Some(combined) => Some(combined),
-                        None => {
-                            self.estimated_cost_mixed_service_tier = true;
-                            None
-                        }
-                    },
-                    None => Some(cost.clone()),
-                };
-            }
-        }
-        match (self.pricing_revision.as_deref(), pricing_revision) {
-            (None, Some(revision)) if !self.pricing_revision_unknown_or_mixed => {
-                self.pricing_revision = Some(revision.to_owned());
-            }
-            (Some(existing), Some(revision)) if existing == revision => {}
-            _ => self.pricing_revision_unknown_or_mixed = true,
         }
     }
 }
@@ -3084,7 +3021,7 @@ impl AgentResult {
         let metadata: AgentMetadata =
             serde_json::from_str(event.payload.get()).map_err(EvalError::AgentTerminal)?;
         let billing_completeness = if metadata.billing_uncertain_response_attempts > 0
-            || metadata.cost_status == CostStatus::EstimatedLowerBound.as_str()
+            || metadata.cost_status == ESTIMATED_LOWER_BOUND_COST_STATUS
         {
             BillingCompleteness::Unknown
         } else {
@@ -3122,7 +3059,7 @@ mod lifecycle_tests {
     use futures_util::{SinkExt, StreamExt};
     use nanocodex_agent::{Nanocodex, OpenAi, Tools};
     use nanocodex_oai_api::{
-        pricing::{CostStatus, PRICING_REVISION, ServiceTier, estimate},
+        pricing::CostStatus,
         responses::{InputTokenDetails, OutputTokenDetails, Usage},
     };
     use nanocodex_tools::{ToolContext, ToolDefinition, ToolOutput, runtime::DynamicToolProvider};
@@ -4064,12 +4001,9 @@ mod lifecycle_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn malformed_terminal_metrics_retain_cost_lower_bound_and_verifier_score() {
+    async fn malformed_terminal_metrics_retain_usage_and_verifier_score() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-        let usage = provider_usage(1, 0, 0, 1, 0);
-        let expected_estimate = estimate(&usage, ServiceTier::Standard);
-        let expected_cost = expected_estimate.amount().as_f64();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
@@ -4162,29 +4096,23 @@ mod lifecycle_tests {
             .expect("completed operation metrics must remain available");
         assert_eq!(agent.metadata.status, AgentStatus::Completed);
         assert_eq!(agent.billing_completeness, BillingCompleteness::Unknown);
-        assert_eq!(agent.cost_usd, Some(expected_cost));
+        assert_eq!(agent.cost_usd, None);
         assert_eq!(
             agent.metadata.cost_status,
-            CostStatus::EstimatedLowerBound.as_str()
+            CostStatus::UsageNotReported.as_str()
         );
-        assert_eq!(
-            agent.metadata.estimated_cost.as_ref(),
-            Some(&expected_estimate)
-        );
+        assert!(agent.metadata.estimated_cost.is_none());
         assert_eq!(result.verifier.rewards.get("reward").copied(), Some(1.0));
         let attempt_directory = result.artifacts.directory.clone();
         let job = recorder.finish(vec![outcome]).await.unwrap();
         let aggregate = job.aggregate_dataset().unwrap();
-        assert_eq!(
-            aggregate.attempts[0].estimated_cost.as_ref(),
-            Some(&expected_estimate)
-        );
+        assert!(aggregate.attempts[0].estimated_cost.is_none());
         assert_eq!(
             aggregate.configurations[0]
                 .observed_cost_components_lower_bound_usd
                 .total_usd
                 .samples,
-            1
+            0
         );
         assert_eq!(
             aggregate.configurations[0]
@@ -4281,10 +4209,6 @@ mod lifecycle_tests {
                     "connection_generation": null,
                     "duration_ns": 10,
                     "usage": null,
-                    "estimated_cost": null,
-                    "cost_usd": null,
-                    "cost_status": CostStatus::NotApplicable,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ))
             .unwrap();
@@ -4301,18 +4225,6 @@ mod lifecycle_tests {
         let warmup_usage = provider_usage(100, 40, 10, 20, 5);
         let generation_usage = provider_usage(200, 100, 20, 30, 8);
         let compaction_usage = provider_usage(50, 10, 5, 6, 0);
-        let warmup_cost = estimate(&warmup_usage, ServiceTier::Standard);
-        let generation_cost = estimate(&generation_usage, ServiceTier::Standard);
-        let compaction_cost = estimate(&compaction_usage, ServiceTier::Standard);
-        let expected_cost_nano_usd = warmup_cost
-            .amount()
-            .nano_usd()
-            .saturating_add(generation_cost.amount().nano_usd())
-            .saturating_add(compaction_cost.amount().nano_usd());
-        let expected_cost = warmup_cost
-            .combined(&generation_cost)
-            .and_then(|cost| cost.combined(&compaction_cost))
-            .unwrap();
         let events = [
             agent_event(
                 1,
@@ -4343,10 +4255,6 @@ mod lifecycle_tests {
                     "connection_generation": 1,
                     "duration_ns": 11,
                     "usage": warmup_usage,
-                    "estimated_cost": warmup_cost,
-                    "cost_usd": warmup_cost.amount().as_f64(),
-                    "cost_status": CostStatus::EstimatedFromUsage,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
             agent_event(
@@ -4373,10 +4281,6 @@ mod lifecycle_tests {
                     "time_to_first_output_ns": 3,
                     "tool_calls": 2,
                     "usage": generation_usage,
-                    "estimated_cost": generation_cost,
-                    "cost_usd": generation_cost.amount().as_f64(),
-                    "cost_status": CostStatus::EstimatedFromUsage,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
             agent_event(
@@ -4400,10 +4304,6 @@ mod lifecycle_tests {
                     "time_to_first_event_ns": 3,
                     "time_to_first_output_ns": 4,
                     "usage": compaction_usage,
-                    "estimated_cost": compaction_cost,
-                    "cost_usd": compaction_cost.amount().as_f64(),
-                    "cost_status": CostStatus::EstimatedFromUsage,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
             agent_event(
@@ -4455,22 +4355,12 @@ mod lifecycle_tests {
         assert_eq!(result.metadata.compactions, 1);
         assert_eq!(result.metadata.response_attempts, 4);
         assert_eq!(result.metadata.response_retries, 1);
-        assert_eq!(
-            result.metadata.pricing_revision.as_deref(),
-            Some(PRICING_REVISION)
-        );
-        assert_eq!(
-            result.cost_usd,
-            Some(nanocodex_agent::UsdAmount::from_nano_usd(expected_cost_nano_usd).as_f64())
-        );
+        assert_eq!(result.cost_usd, None);
         assert_eq!(
             result.metadata.cost_status,
-            CostStatus::EstimatedLowerBound.as_str()
+            CostStatus::UsageNotReported.as_str()
         );
-        assert_eq!(
-            result.metadata.estimated_cost.as_ref(),
-            Some(&expected_cost)
-        );
+        assert!(result.metadata.estimated_cost.is_none());
     }
 
     #[test]
@@ -4540,10 +4430,6 @@ mod lifecycle_tests {
                     "time_to_first_output_ns": 3,
                     "tool_calls": 1,
                     "usage": null,
-                    "estimated_cost": null,
-                    "cost_usd": null,
-                    "cost_status": CostStatus::UsageNotReported,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
             agent_event(13, AgentEventKind::ToolCall, json!({})),
@@ -4606,7 +4492,6 @@ mod lifecycle_tests {
     #[test]
     fn missing_usage_marks_terminal_unknown_and_terminal_metrics_take_precedence() {
         let reported_usage = provider_usage(10, 2, 1, 4, 1);
-        let reported_cost = estimate(&reported_usage, ServiceTier::Standard);
         let mut observation = AgentObservation::default();
         for event in [
             agent_event(
@@ -4648,10 +4533,6 @@ mod lifecycle_tests {
                     "time_to_first_output_ns": 2,
                     "tool_calls": 0,
                     "usage": reported_usage,
-                    "estimated_cost": reported_cost,
-                    "cost_usd": reported_cost.amount().as_f64(),
-                    "cost_status": CostStatus::EstimatedFromUsage,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
             agent_event(
@@ -4678,10 +4559,6 @@ mod lifecycle_tests {
                     "time_to_first_output_ns": null,
                     "tool_calls": 0,
                     "usage": null,
-                    "estimated_cost": null,
-                    "cost_usd": null,
-                    "cost_status": CostStatus::UsageNotReported,
-                    "pricing_revision": PRICING_REVISION,
                 }),
             ),
         ] {
@@ -4699,17 +4576,13 @@ mod lifecycle_tests {
             .unwrap();
         assert_eq!(fallback.billing_completeness, BillingCompleteness::Unknown);
         assert_eq!(fallback.model_calls, 2);
-        assert_eq!(fallback.cost_usd, Some(reported_cost.amount().as_f64()));
+        assert_eq!(fallback.cost_usd, None);
         assert_eq!(
             fallback.metadata.cost_status,
-            CostStatus::EstimatedLowerBound.as_str()
+            CostStatus::UsageNotReported.as_str()
         );
 
-        let terminal = agent_event(
-            6,
-            AgentEventKind::RunCompleted,
-            terminal_payload(77, 0.75, "terminal-pricing"),
-        );
+        let terminal = agent_event(6, AgentEventKind::RunCompleted, terminal_payload(77, 0.75));
         let terminal_result =
             observation.select_result(Some(&terminal), observation.billing_completeness());
         assert!(!terminal_result.used_lower_bound);
@@ -4718,10 +4591,6 @@ mod lifecycle_tests {
         assert_eq!(terminal_result.model_calls, 77);
         assert_eq!(terminal_result.usage.input_tokens, 7);
         assert_eq!(terminal_result.cost_usd, Some(0.75));
-        assert_eq!(
-            terminal_result.metadata.pricing_revision.as_deref(),
-            Some("terminal-pricing")
-        );
         assert_eq!(
             terminal_result.billing_completeness,
             BillingCompleteness::Unknown
@@ -4735,7 +4604,7 @@ mod lifecycle_tests {
         assert!(invalid.terminal_error.is_some());
         let invalid = invalid.result.unwrap();
         assert_eq!(invalid.metadata.status, AgentStatus::Completed);
-        assert_eq!(invalid.cost_usd, Some(reported_cost.amount().as_f64()));
+        assert_eq!(invalid.cost_usd, None);
 
         let invalid_terminal = agent_event(8, AgentEventKind::RunFailed, json!({"invalid": true}));
         let invalid =
@@ -4776,7 +4645,7 @@ mod lifecycle_tests {
 
     #[test]
     fn retained_terminal_metadata_accepts_legacy_billing_field_and_writes_new_name() {
-        let mut payload = terminal_payload(1, 0.25, "test-pricing");
+        let mut payload = terminal_payload(1, 0.25);
         payload
             .as_object_mut()
             .unwrap()
@@ -4823,7 +4692,7 @@ mod lifecycle_tests {
         .unwrap()
     }
 
-    fn terminal_payload(model_calls: u32, cost_usd: f64, pricing_revision: &str) -> Value {
+    fn terminal_payload(model_calls: u32, cost_usd: f64) -> Value {
         json!({
             "status": "completed",
             "model": "terminal-model",
@@ -4864,7 +4733,6 @@ mod lifecycle_tests {
             },
             "cost_usd": cost_usd,
             "cost_status": "estimated_from_usage",
-            "pricing_revision": pricing_revision,
         })
     }
 

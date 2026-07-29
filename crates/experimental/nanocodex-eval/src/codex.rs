@@ -1022,7 +1022,6 @@ impl CodexTranscript {
                 "usage_not_reported"
             }
             .to_owned(),
-            pricing_revision: None,
             estimated_cost: None,
         };
         Some(AgentResult {

@@ -55,8 +55,6 @@ pub struct AttemptFact {
     pub cost_usd: Option<f64>,
     /// Exact input/cache/output estimate composition, when usage was priced.
     pub estimated_cost: Option<EstimatedUsdCost>,
-    /// Pricing catalog revision used for [`Self::estimated_cost`].
-    pub pricing_revision: Option<String>,
     /// Whether provider billing is known to be terminal.
     pub billing_completeness: Option<BillingCompleteness>,
     /// Whether agent execution began but retained no billing snapshot.
@@ -179,8 +177,6 @@ pub struct AggregateRunIdentity {
     pub reasoning_effort: String,
     /// Provider service tier.
     pub service_tier: Option<String>,
-    /// Pricing catalog revision.
-    pub pricing_revision: String,
     /// Application-owned tool configuration identity.
     pub tool_profile: String,
     /// Reproducibility seed, when configured.
@@ -553,7 +549,6 @@ impl AttemptFact {
             runtime: AttemptRuntimeMetrics::from_agent(agent),
             cost_usd: agent.and_then(|agent| agent.cost_usd),
             estimated_cost: agent.and_then(|agent| agent.metadata.estimated_cost.clone()),
-            pricing_revision: agent.and_then(|agent| agent.metadata.pricing_revision.clone()),
             billing_completeness: agent.map(|agent| agent.billing_completeness),
             latency: LatencyBreakdown {
                 queue_wait_ns: duration(
@@ -655,7 +650,6 @@ impl AttemptFact {
             runtime: AttemptRuntimeMetrics::from_agent(agent),
             cost_usd: agent.and_then(|agent| agent.cost_usd),
             estimated_cost: agent.and_then(|agent| agent.metadata.estimated_cost.clone()),
-            pricing_revision: agent.and_then(|agent| agent.metadata.pricing_revision.clone()),
             billing_completeness: agent.map(|agent| agent.billing_completeness),
             latency: LatencyBreakdown {
                 queue_wait_ns: duration(Some(&failure.timing.queue_wait)),
@@ -920,7 +914,6 @@ impl AggregateDataset {
                 .agent_topology
                 .clone_from(&identity.agent_topology);
             attempt.configuration.vm.clone_from(&identity.vm);
-            attempt.pricing_revision = Some(identity.pricing_revision.clone());
         }
         let run_timing = self.run_timing;
         let mut rebuilt = Self::new(self.attempts);
@@ -1377,7 +1370,6 @@ mod tests {
             runtime: None,
             cost_usd: Some(f64::from(repetition)),
             estimated_cost: None,
-            pricing_revision: Some("fixture-pricing-v1".to_owned()),
             billing_completeness: Some(BillingCompleteness::Complete),
             billing_snapshot_missing: false,
             latency: LatencyBreakdown {
@@ -1418,10 +1410,6 @@ mod tests {
         assert_eq!(
             dataset.attempts[0].configuration.tool_profile.as_deref(),
             Some("fixture-tools")
-        );
-        assert_eq!(
-            dataset.attempts[0].pricing_revision.as_deref(),
-            Some("fixture-pricing-v1")
         );
         let encoded = serde_json::to_value(&dataset).unwrap();
         assert_eq!(encoded["schema_version"], 4);

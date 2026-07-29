@@ -51,8 +51,6 @@ struct AtifFinalMetricsExtraWire {
     #[serde(default)]
     billing_completeness: Option<BillingCompleteness>,
     #[serde(default)]
-    pricing_revision: Option<String>,
-    #[serde(default)]
     usage_completeness: Option<MeasurementCompleteness>,
     #[serde(default)]
     runtime_completeness: Option<MeasurementCompleteness>,
@@ -88,7 +86,6 @@ impl From<AtifTrajectoryWire> for AtifTrajectory {
                     tool_calls: extra.tool_calls,
                     duration_ns: extra.duration_ns,
                     billing_completeness: extra.billing_completeness,
-                    pricing_revision: extra.pricing_revision,
                     usage_completeness: extra.usage_completeness,
                     runtime_completeness,
                     runtime: extra.runtime,
@@ -334,9 +331,6 @@ pub struct AtifFinalMetricsExtra {
     /// provider usage event.
     #[serde(default)]
     pub billing_completeness: Option<BillingCompleteness>,
-    /// Built-in pricing catalog revision used for the estimate.
-    #[serde(default)]
-    pub pricing_revision: Option<String>,
     /// Whether aggregate token counts are complete, observed lower bounds, or
     /// absent (`None`).
     #[serde(default)]
@@ -606,7 +600,6 @@ impl AtifBuilder {
                     tool_calls: u32::try_from(tool_calls).unwrap_or(u32::MAX),
                     duration_ns,
                     billing_completeness: None,
-                    pricing_revision: None,
                     usage_completeness: usage_observed
                         .then_some(MeasurementCompleteness::ObservedLowerBound),
                     runtime_completeness: MeasurementCompleteness::ObservedLowerBound,
@@ -680,7 +673,6 @@ pub(crate) fn finish_projected_trajectory(
                 tool_calls: result.tool_calls,
                 duration_ns: result.metadata.duration_ns,
                 billing_completeness: Some(result.billing_completeness),
-                pricing_revision: result.metadata.pricing_revision.clone(),
                 usage_completeness: atif_usage_completeness(result),
                 runtime_completeness: result.metadata.runtime_completeness,
                 runtime: AtifRuntimeMetrics::from(&result.metadata),
@@ -1030,7 +1022,6 @@ mod tests {
         let mut failed = result.clone();
         failed.metadata.status = AgentStatus::Failed;
         failed.metadata.runtime_completeness = MeasurementCompleteness::ObservedLowerBound;
-        failed.metadata.pricing_revision = Some("test-pricing-v1".to_owned());
         failed.cost_usd = Some(0.125);
         failed.billing_completeness = BillingCompleteness::Unknown;
         let mut builder = AtifBuilder::default();
@@ -1048,10 +1039,6 @@ mod tests {
         assert_eq!(
             trajectory.final_metrics.extra.usage_completeness,
             Some(crate::MeasurementCompleteness::ObservedLowerBound)
-        );
-        assert_eq!(
-            trajectory.final_metrics.extra.pricing_revision.as_deref(),
-            Some("test-pricing-v1")
         );
         assert_eq!(
             trajectory.steps[2]

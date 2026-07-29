@@ -232,7 +232,7 @@ not source-controlled.
 Later focused schema gates retain `timing.json` with cold image/cache and warm
 attempt wall time, plus per-attempt scheduler queue and VM readiness phases.
 Invocation schema v2 retains the exact executable SHA-256, Git/build identity,
-model, tool profile, pricing revision, explicit absence of a seed, and
+model, tool profile, explicit absence of a seed, and
 scheduling policy/source. These additions passed deterministic CLI and
 projection tests; the paid live jobs above use the preceding schema and are
 not presented as evidence for the new fields.

@@ -53,6 +53,8 @@ pub struct VmCommand {
     environment: Vec<(String, String)>,
     timeout: Duration,
     max_output_bytes: usize,
+    stdout_mirror: Option<String>,
+    stderr_mirror: Option<String>,
 }
 
 impl VmCommand {
@@ -67,6 +69,8 @@ impl VmCommand {
             environment: Vec::new(),
             timeout: Duration::from_mins(1),
             max_output_bytes: DEFAULT_COMMAND_OUTPUT_BYTES,
+            stdout_mirror: None,
+            stderr_mirror: None,
         }
     }
 
@@ -102,6 +106,19 @@ impl VmCommand {
     #[must_use]
     pub const fn max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    /// Mirrors output into harness-owned guest files while retaining the same
+    /// bounded terminal output.
+    ///
+    /// The files are truncated before the process starts and updated as bytes
+    /// arrive, so another session request can observe long-running command
+    /// progress without weakening terminal output or timeout semantics.
+    #[must_use]
+    pub fn mirror_output(mut self, stdout: impl Into<String>, stderr: impl Into<String>) -> Self {
+        self.stdout_mirror = Some(stdout.into());
+        self.stderr_mirror = Some(stderr.into());
         self
     }
 }
@@ -1037,6 +1054,8 @@ impl VmToolSessionHandle {
                     environment: command.environment,
                     timeout_millis,
                     max_output_bytes,
+                    stdout_mirror: command.stdout_mirror,
+                    stderr_mirror: command.stderr_mirror,
                 })
             })
             .await?;

@@ -18,6 +18,7 @@ use nix::{
 };
 use thiserror::Error;
 use tokio::{
+    fs::{File, OpenOptions},
     io::{
         AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
         BufReader,
@@ -480,6 +481,14 @@ async fn read_file(request: ReadFileRequest) -> ReadFileResponse {
 }
 
 async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
+    let stdout_mirror = match open_output_mirror(request.stdout_mirror.as_deref()).await {
+        Ok(mirror) => mirror,
+        Err(error) => return failed_execute_response(request.id, error),
+    };
+    let stderr_mirror = match open_output_mirror(request.stderr_mirror.as_deref()).await {
+        Ok(mirror) => mirror,
+        Err(error) => return failed_execute_response(request.id, error),
+    };
     let environment = command_environment(std::env::vars_os(), &request.environment);
     let mut command = Command::new(&request.program);
     command
@@ -494,7 +503,15 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
     command.process_group(0);
 
     let timeout = Duration::from_millis(request.timeout_millis);
-    match command_output(&mut command, timeout, request.max_output_bytes).await {
+    match command_output(
+        &mut command,
+        timeout,
+        request.max_output_bytes,
+        stdout_mirror,
+        stderr_mirror,
+    )
+    .await
+    {
         Ok(CommandOutcome::Completed(output)) => ExecuteResponse {
             id: request.id,
             exit_code: Some(output.status.code().unwrap_or(1)),
@@ -522,15 +539,32 @@ async fn execute_command(request: ExecuteRequest) -> ExecuteResponse {
             timed_out: false,
             output_limit_exceeded: true,
         },
-        Err(error) => ExecuteResponse {
-            id: request.id,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            error: Some(error.to_string()),
-            timed_out: false,
-            output_limit_exceeded: false,
-        },
+        Err(error) => failed_execute_response(request.id, error),
+    }
+}
+
+async fn open_output_mirror(path: Option<&str>) -> std::io::Result<Option<File>> {
+    match path {
+        Some(path) => OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+fn failed_execute_response(id: u64, error: std::io::Error) -> ExecuteResponse {
+    ExecuteResponse {
+        id,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        error: Some(error.to_string()),
+        timed_out: false,
+        output_limit_exceeded: false,
     }
 }
 
@@ -564,6 +598,8 @@ async fn command_output(
     command: &mut Command,
     timeout: Duration,
     max_output_bytes: usize,
+    stdout_mirror: Option<File>,
+    stderr_mirror: Option<File>,
 ) -> std::io::Result<CommandOutcome> {
     let mut child = command.spawn()?;
     let process_group = child
@@ -586,12 +622,14 @@ async fn command_output(
         Arc::clone(&retained),
         max_output_bytes,
         limit_sender.clone(),
+        stdout_mirror,
     ));
     let mut stderr = tokio::spawn(read_bounded(
         stderr,
         Arc::clone(&retained),
         max_output_bytes,
         limit_sender,
+        stderr_mirror,
     ));
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -669,6 +707,7 @@ async fn read_bounded(
     retained: Arc<AtomicUsize>,
     limit: usize,
     limit_sender: mpsc::Sender<()>,
+    mut mirror: Option<File>,
 ) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
@@ -676,7 +715,14 @@ async fn read_bounded(
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
+            if let Some(mirror) = &mut mirror {
+                mirror.flush().await?;
+            }
             break;
+        }
+        if let Some(mirror) = &mut mirror {
+            mirror.write_all(&buffer[..read]).await?;
+            mirror.flush().await?;
         }
         let offset = retained.fetch_add(read, Ordering::Relaxed);
         let allowed = limit.saturating_sub(offset).min(read);
@@ -782,6 +828,8 @@ mod tests {
             environment: Vec::new(),
             timeout_millis: 100,
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            stdout_mirror: None,
+            stderr_mirror: None,
         })
         .await;
 
@@ -808,6 +856,8 @@ mod tests {
             environment: Vec::new(),
             timeout_millis: 5_000,
             max_output_bytes: 8,
+            stdout_mirror: None,
+            stderr_mirror: None,
         })
         .await;
 
@@ -816,6 +866,47 @@ mod tests {
         assert!(response.error.is_none());
         assert!(response.stdout.is_none());
         assert!(response.stderr.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_output_is_mirrored_before_the_process_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let stdout = directory.path().join("stdout");
+        let stderr = directory.path().join("stderr");
+        let execution = tokio::spawn(execute_command(ExecuteRequest {
+            id: 1,
+            program: "/bin/sh".to_owned(),
+            arguments: vec![
+                "-c".to_owned(),
+                "printf first; printf diagnostic >&2; sleep 0.5; printf second".to_owned(),
+            ],
+            current_directory: "/".to_owned(),
+            environment: Vec::new(),
+            timeout_millis: 5_000,
+            max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            stdout_mirror: Some(stdout.to_string_lossy().into_owned()),
+            stderr_mirror: Some(stderr.to_string_lossy().into_owned()),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if fs::read(&stdout).is_ok_and(|contents| contents == b"first")
+                    && fs::read(&stderr).is_ok_and(|contents| contents == b"diagnostic")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mirrors should expose initial output while the process runs");
+        assert!(!execution.is_finished());
+
+        let response = execution.await.unwrap();
+        assert_eq!(response.stdout.as_deref(), Some(b"firstsecond".as_slice()));
+        assert_eq!(response.stderr.as_deref(), Some(b"diagnostic".as_slice()));
+        assert_eq!(fs::read(stdout).unwrap(), b"firstsecond");
+        assert_eq!(fs::read(stderr).unwrap(), b"diagnostic");
     }
 
     #[tokio::test]
@@ -862,6 +953,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Execute(ExecuteRequest {
                 id: 1,
@@ -871,6 +964,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write
@@ -925,6 +1020,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 60_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Shutdown(ShutdownRequest { id: 1 }),
         ] {
@@ -968,6 +1065,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 60_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
             SessionRequest::Cancel(CancelRequest {
                 id: 1,
@@ -981,6 +1080,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write
@@ -1174,6 +1275,8 @@ mod tests {
                 environment: Vec::new(),
                 timeout_millis: 5_000,
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                stdout_mirror: None,
+                stderr_mirror: None,
             }),
         ] {
             host_write

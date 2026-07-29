@@ -41,9 +41,9 @@ use nanocodex_eval::{
     Sweep, SweepResults, Task, TaskLoadError, VerifierEnvironmentMode, VerifierResult,
     infer_retained_scored,
 };
+use nanocodex_vm::host::{BlockDevice, GuestCommand, Network, SharedDirectory, VmConfig};
 use nanocodex_vm::image::{CachePolicy, VmImageBuilder, reflink_or_sparse_copy};
-use nanocodex_vm::{BlockDevice, GuestCommand, Network, SharedDirectory, VmConfig};
-use nanocodex_vm::{
+use nanocodex_vm::tools::{
     GuestRuntimeDisk, GuestRuntimeDiskStatus, VmCommand, VmCommandOutput, VmCommandPartialOutput,
     VmToolSession, VmToolSessionError, VmToolSessionHandle,
 };
@@ -261,7 +261,6 @@ struct RunInvocation {
     version: u32,
     nanocodex_build: RetainedBuild,
     model: String,
-    pricing_revision: String,
     tool_profile: String,
     seed: Option<u64>,
     scheduling: RetainedScheduling,
@@ -315,7 +314,6 @@ impl RunInvocation {
         self.version == other.version
             && self.nanocodex_build == other.nanocodex_build
             && self.model == other.model
-            && self.pricing_revision == other.pricing_revision
             && self.tool_profile == other.tool_profile
             && self.seed == other.seed
             && self.scheduling.policy == other.scheduling.policy
@@ -940,7 +938,6 @@ fn aggregate_run_identity(invocation: &RunInvocation) -> AggregateRunIdentity {
         model_tier: None,
         reasoning_effort: invocation.thinking.clone(),
         service_tier: Some("standard".to_owned()),
-        pricing_revision: invocation.pricing_revision.clone(),
         tool_profile: invocation.tool_profile.clone(),
         seed: invocation.seed,
         agent_topology: "single_agent".to_owned(),
@@ -1001,7 +998,6 @@ impl ResolvedRun {
                 executable_sha256,
             },
             model: nanocodex::oai::MODEL.to_owned(),
-            pricing_revision: nanocodex::oai::pricing::PRICING_REVISION.to_owned(),
             tool_profile: if self.vm || self.vm_rootfs.is_some() {
                 "microvm_workspace".to_owned()
             } else {
@@ -5992,7 +5988,7 @@ mod tests {
         BillingCompleteness, CleanupPhase, CleanupStatus, EvalAttempt, EvalOutcome, Evaluator,
         Sweep, Task, VerifierResult,
     };
-    use nanocodex_vm::{
+    use nanocodex_vm::tools::{
         VmCommandOutput, VmCommandPartialOutput, VmToolSession, VmToolSessionError,
     };
     use nix::unistd::getpgrp;
@@ -6657,7 +6653,7 @@ mod tests {
         let requested = root.path().join("exact-guest-runtime");
         fs::write(&requested, &bytes).unwrap();
         let (artifact_path, artifact) = super::retain_guest_runtime_bytes(&job, &bytes).unwrap();
-        let runtime_disk = nanocodex_vm::GuestRuntimeDisk::prepare(
+        let runtime_disk = nanocodex_vm::tools::GuestRuntimeDisk::prepare(
             &artifact,
             job.join(super::GUEST_RUNTIME_CACHE_ROOT),
         )
@@ -6743,7 +6739,7 @@ mod tests {
         let bytes = guest_elf(super::VM_GUEST_ELF_MACHINE);
         let (artifact_path, artifact) =
             super::retain_guest_runtime_bytes(job.path(), &bytes).unwrap();
-        let runtime_disk = nanocodex_vm::GuestRuntimeDisk::prepare(
+        let runtime_disk = nanocodex_vm::tools::GuestRuntimeDisk::prepare(
             &artifact,
             job.path().join(super::GUEST_RUNTIME_CACHE_ROOT),
         )
@@ -6874,7 +6870,6 @@ mod tests {
                 executable_sha256: "abc123".to_owned(),
             },
             model: "gpt-5.6-sol".to_owned(),
-            pricing_revision: "test-pricing-v1".to_owned(),
             tool_profile: "microvm_workspace".to_owned(),
             seed: None,
             scheduling: RetainedScheduling {
@@ -7262,7 +7257,6 @@ mod tests {
                     executable_sha256: "abc123".to_owned(),
                 },
                 model: "gpt-5.6-sol".to_owned(),
-                pricing_revision: "test-pricing-v1".to_owned(),
                 tool_profile: "native_workspace".to_owned(),
                 seed: None,
                 scheduling: super::RetainedScheduling {

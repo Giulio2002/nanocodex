@@ -2,112 +2,235 @@
 
 ## Objective
 
-Build high-quality reusable Rust building blocks for frontier OpenAI agents.
-Nanocodex makes a small number of deliberate choices about libraries, public
-APIs, performance, and observability while following the supported Codex
-harness behavior exactly. It does not reimplement policy already owned by the
-model or harness.
+Build a lean, library-first reimplementation of the supported Codex agent loop:
+Codex-level benchmark performance with Pi-like customizability. Nanocodex owns
+the complete agent lifecycle and typed OpenAI boundary without inheriting an
+app server, generic provider layer, approval framework, or other product
+surface that an embedding application does not need.
 
-Every stable crate must be useful independently, documented from its own
-README, tested through its public paths, benchmarked at the boundaries it can
+The development method is differential and eval-driven. We run Nanocodex and a
+pinned stock-Codex binary on the same tasks with the same model, effort, tool
+mode, and task inputs; compare their behavior while it is happening; and turn
+demonstrated differences in the event loop, context construction, cache use, or
+tools into focused changes and regression tests.
+
+Every stable crate must remain useful independently, documented from its own
+README, tested through public paths, benchmarked at the boundaries it can
 affect, and observable without adopting the Nanocodex CLI.
 
-## PR #50 delivery boundary
+## Delivery stack
 
-PR #50 is the only active delivery target. It must preserve behavior available
-on `master` unless a removal is explicit and covered by a regression or
-migration, and it must be independently mergeable.
+### Part 1 — Stable agent and API foundations
 
-1. **Re-establish Codex parity**
-   - Treat `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`
-     as the last authoritative reviewed checkpoint.
-   - Inspect and classify every later upstream commit before advancing that
-     checkpoint.
-   - Differentially verify prompt-cache identity and stable prefixes;
-     `AGENTS.md` and environment injection; typed history and
-     `previous_response_id`; reconnect/full replay; automatic/manual
-     compaction; steering/cancellation; completed-only commits; retries and
-     fallback; tool ordering, errors, panics, and process cleanup; and shared
-     ChatGPT authentication.
-   - Fix demonstrated mismatches test-first. Record intentional differences
-     explicitly; do not silently call them parity.
+PR #50 established the library boundaries and the first reviewed Codex-parity
+checkpoint:
 
-2. **Stabilize crate ownership and public paths**
-   - `nanocodex-oai-api` owns the complete OpenAI boundary and honest Tower
-     seams.
-   - `nanocodex-tools` owns tool implementations, Code Mode, MCP, and deferred
-     search.
-   - `nanocodex-agent` owns the private driver, lifecycle, state, branching,
-     snapshots, and rollouts.
-   - `nanocodex` remains a thin Alloy-style facade.
-   - Keep mutable run configuration, events plumbing, attempt factories,
-     response/turn IDs, queues, sockets, and replay bookkeeping private.
-   - Remove accidental exports, compatibility leftovers, duplicate bindings,
-     empty directories, unused dependencies/features, and unnecessary cfgs.
+- `nanocodex-oai-api` owns the typed Responses boundary, retained context,
+  retry/reconnect policy, telemetry, and generic Tower client.
+- `nanocodex-tools` owns Code Mode, built-in tools, MCP, deferred tool search,
+  and remote dispatch.
+- `nanocodex-agent` owns the private driver, lifecycle, branching, snapshots,
+  and rollouts.
+- `nanocodex` remains a thin Alloy-style facade.
+- The local Codex checkout and parity ledger remain the evidence for
+  architecture and behavior claims.
 
-3. **Make the stable APIs legible**
-   - Give each stable crate a focused README included into crate docs.
-   - Put the normal consumer path first and advanced Tower/protocol surfaces
-     behind progressive disclosure.
-   - Compile complete public examples through canonical paths.
-   - Keep `OpenAiBuilder::{layer,service}` as the deliberate transport seam.
+### Part 2 — Retained VM foundations
 
-4. **Lock in performance and observability**
-   - Define representative benchmarks and explicit thresholds for request
-     construction, history replay/checkpointing, context accounting and
-     compaction, event delivery, tool dispatch, Code Mode, MCP discovery/search,
-     and changed TUI state/render work.
-   - Follow init4-style bounded spans and explicit parent propagation while
-     keeping contractual events independent from tracing.
-   - Preserve full-fidelity ordered prompts, model traffic, reasoning and
-     encrypted reasoning, tool activity, steering, cancellation, token/cache
-     data, latency, and automatic `gpt-5.6-sol` USD cost.
+PR #58 added the VM machinery used by interactive agents and native
+evaluation:
 
-5. **Prove the complete PR path**
-   - Validate crate boundaries, formatting, warnings-denied Clippy, workspace
-     and all-target tests, rustdoc/doctests/examples, WASM, Node/browser, PyO3,
-     CLI/Ratatui, and a live native smoke.
-   - Run the stock-Codex differential suite.
-   - Terminal-Bench 2.1 milestone evaluation is delegated to the user's
-     separate thread. This thread does not bootstrap Harbor, alter eval inputs,
-     or wait on that result.
-   - Fix every real PR #50 CI failure and leave required checks green with no
-     known merge blocker.
+- retained libkrun workspaces and VM-backed workspace tools;
+- typed guest control, bounded process cleanup, image preparation, and cache
+  lifecycle;
+- explicit opt-in VM use from one-shot and interactive Nanocodex consumers;
+- a dedicated VMM process boundary suitable for Linux hosts and macOS
+  development.
+
+Part 2 supplies isolation primitives. It does not make Harbor the evaluation
+runner and it does not by itself claim a host-saturating benchmark scheduler.
+
+### Part 3 — Native evaluation, Codex differential parity, and fast experiments
+
+Part 3 is a new first-class evaluation feature implemented by
+`nanocodex-eval` and the complete `nanocodex eval ...` CLI. Nanoeval code owns
+task loading, scheduling, execution, verification, durable records,
+aggregation, and comparison. Harbor-compatible JSONL/ATIF and archive
+comparison are presentation and interoperability formats only; no Harbor
+runner participates in execution.
+
+#### 1. Complete native command surface
+
+Support both ordinary Nanocodex evaluation and differential evaluation from
+one executable:
+
+- `nanocodex eval` runs one or more tasks or suites with configurable trials,
+  retries, concurrency, memory limits, retained jobs, resume, VM policy, and
+  agent settings.
+- `nanocodex eval prepare`, `task`, `inspect`, `compare`, and `cleanup` manage
+  task inputs and exact retained evidence.
+- `nanocodex eval vm ...` exposes the low-level image/VMM diagnostic boundary.
+- `nanocodex eval diff` starts paired Nanocodex and stock-Codex attempts for
+  the same task and configuration.
+
+The evaluator must retain exact task and verifier revisions, executable
+digests, model metadata, tool mode, effort, prompts, tool definitions, ordered
+events, API traffic, trajectories, verifier evidence, token/cache usage, cost,
+and phase timing. Benchmark tasks and verifiers are immutable inputs.
+
+#### 2. Streaming differential loop
+
+Paired implementations start concurrently, use the same `gpt-5.6-sol`
+reasoning effort, and expose progress as it arrives. The differ should identify
+the first meaningful divergence without waiting for both attempts to time out
+or finish.
+
+Compare more than final answers and scores:
+
+- complete instructions and environment injection;
+- outer and nested tool definitions, descriptions, schemas, and ordering;
+- every Responses request and visible response event;
+- reasoning summaries and encrypted reasoning items observable at the API;
+- tool calls, arguments, outputs, timing, errors, and process cleanup;
+- typed history deltas, `previous_response_id`, reconnect replay, compaction,
+  retry, and cancellation behavior;
+- stable prompt-cache identity, byte-stable prefixes, cached-input tokens, and
+  model-call/token counts;
+- terminal verifier result, latency breakdown, and estimated cost.
+
+The live view must make stalls obvious and distinguish a still-running model
+call, tool work, verifier work, retry/backoff, lost guest process, and completed
+attempt. Full raw evidence remains on disk even when the terminal view shows a
+compact semantic diff.
+
+#### 3. Mode-controlled parity program
+
+The initial Terminal-Bench 2.1 program pins both implementations to
+`code_mode_only`. First establish a complete task inventory and work through it
+task by task, maintaining a running on-disk log of outcomes and diagnosed
+differences.
+
+After that baseline:
+
+1. compare stock Codex in its normal Code Mode configuration against stock
+   Codex forced to `code_mode_only`, holding model, effort, task, and repetition
+   constant;
+2. determine whether direct model-visible tools outside Code Mode improve
+   success, cost, latency, or robustness;
+3. implement that mixed tool exposure in Nanocodex only if the controlled stock
+   Codex result demonstrates a benefit;
+4. rerun the Nanocodex-versus-Codex differential matrix at each supported
+   effort.
+
+Do not infer a loop change from one successful trajectory. Retain repetitions
+and classify whether a difference is prompt/context, cache/transport, model
+sampling, tool execution, verifier interaction, or scheduler contention.
+
+#### 4. Host-saturating execution
+
+The primary throughput target is `ssh ubuntu@dev-georgios`. Turbo evaluation
+must keep the host busy across many Terminal-Bench tasks, efforts,
+implementations, modes, and repetitions without multiplying idle VM memory by
+every matrix coordinate.
+
+The target allocation unit is one task-worker VM per active benchmark task.
+Within it, each
+`(implementation × tool mode × effort × repetition)` coordinate runs in a
+fresh isolated tenant:
+
+- immutable task lower image plus a private per-attempt overlay;
+- private user, mount, PID, IPC, UTS, and network namespaces;
+- a private process tree, workspace, ports, temporary paths, outputs, and
+  verifier evidence;
+- cgroup-v2 CPU, memory, process, and I/O bounds;
+- a separate verifier tenant or mount boundary that the agent cannot inspect.
+
+Use a mature Linux isolation runtime for those tenant boundaries rather than
+inventing a sandbox. Tasks that need kernel-global privileges or cannot meet
+the shared-worker isolation contract fall back to an exclusive VM.
+
+A memory-weighted, work-conserving host scheduler admits only as many task
+workers as available RAM permits, fills each with runnable coordinates, and
+backfills freed slots immediately. It records queueing, admission, boot,
+readiness, warm agent, model, tool, verifier, and cleanup time independently.
+Saturated throughput runs and low-contention latency runs are separate modes:
+contended wall time is useful capacity evidence but not clean per-agent latency
+evidence.
+
+The throughput gate is representative retained evidence that the scheduler
+saturates CPU/network capacity on the target host, respects memory limits,
+drains and resumes without losing attempt cardinality, and uses materially less
+VM overhead than one VM per coordinate.
+
+#### 5. Experiment layer after parity
+
+Once the baseline loop is understood, the same retained evaluator should make
+agent experiments cheap:
+
+- PR #32-style recursive/RLM task tools remain an optional consumer layered on
+  the owned session API, not a second core scheduler;
+- TACT-style trajectory analysis can label overthinking, overacting, and
+  calibrated steps from retained traces;
+- context, cache, compaction, tool-exposure, and reasoning-effort experiments
+  use the same task inputs and differential artifacts.
+
+The goal is a fast cycle: launch a bounded sweep, observe live drift, inspect
+the exact paired evidence, make one justified loop change, and rerun only the
+coordinates needed to test it.
+
+#### Part 3 completion gates
+
+Part 3 is complete when:
+
+- the full CLI surface compiles and has focused deterministic tests;
+- ordinary native eval and paired Codex diff both pass a fresh local smoke from
+  `master`;
+- the complete Terminal-Bench 2.1 task list and running comparison log are
+  retained on disk;
+- a controlled `code_mode_only` matrix can run across tasks and reasoning
+  efforts with exact paired artifacts;
+- the differ reports request, response, context/cache, tool, trajectory, and
+  verifier divergence while attempts run;
+- interrupted and resumed sweeps preserve exact cardinality and partial
+  evidence;
+- the task-worker isolation contract has an executable regression gate; and
+- a representative Turbo run demonstrates bounded, host-saturating execution
+  on `dev-georgios`.
+
+Current status (2026-07-28): PR #58 is merged. The native evaluator,
+Harbor-compatible presentation, `nanocodex eval` command tree, stock-Codex
+capture proxy, paired runner, semantic differ, task inventory, and running log
+are being integrated on current `master`. Earlier one-task evidence is useful
+development input but must be rerun from the new PR head. The current
+per-attempt VM adapter is not yet the task-worker allocation described above,
+so no one-VM-per-task or host-saturation claim is complete.
 
 ## Current execution order
 
-1. [x] Complete the [Codex parity ledger](docs/CODEX_PARITY.md) from the pinned
-   checkpoint through
-   `openai/codex@be2e4afcd7392339d6adbaf0d31b26316bcaa2ab`.
-2. [x] Finish the behavior-preserving rollout, model/run, tool/runtime, and
-   driver module decompositions.
-3. [x] Verify the documented parity contracts and fix confirmed mismatches
-   test-first.
-4. [x] Establish 39 benchmark thresholds, retained-trace TUI gates, and the
-   full-fidelity observability path.
-5. [x] Run the in-scope consumer, differential, documentation, and smoke gates.
-   Terminal-Bench milestone evaluation remains delegated to the user's
-   separate thread.
-6. [x] Verify remote PR #50 head `c55293c` as `MERGEABLE`/`CLEAN` with all
-   required checks green before this documentation audit.
-7. [x] Correct stale public guides, add a `0.2.x` migration map, and rerun the
-   focused documentation checks.
-8. [ ] Classify the ten currently unreviewed local Codex commits from
-   `be2e4afc` through `bb1af235` before advancing the parity checkpoint.
-9. [x] Expose nameable generic Tower service-factory types and the standalone
-   session's protocol-level tool definitions and paired outputs. Keep
-   `nanocodex-tools::Tools` composition in the batteries-included agent rather
-   than adding `Session::tools`.
-10. [ ] Rerun required PR checks after the closeout changes and confirm the new
-    remote head is mergeable.
+1. [x] Merge the stable agent/API refactor and retained VM foundation.
+2. [ ] Integrate `nanocodex-eval` and the complete `nanocodex eval ...` CLI on
+   current `master`.
+3. [ ] Rerun a local native smoke and one paired `code_mode_only` Terminal-Bench
+   2.1 task; inspect exact JSONL, ATIF, API capture, trajectory, and verifier
+   output.
+4. [ ] Strengthen the live differ wherever that evidence exposes an ambiguous
+   or late diagnosis.
+5. [ ] Implement and gate task-worker tenant isolation and the memory-weighted
+   work-conserving scheduler.
+6. [ ] Run the bounded Terminal-Bench 2.1 differential matrix on
+   `dev-georgios`, maintaining the on-disk task log.
+7. [ ] Run stock Codex normal Code Mode versus `code_mode_only`; adopt mixed
+   tool exposure only if the controlled result is better.
+8. [ ] Layer RLM and trajectory-labeling experiments on the proven evaluator.
 
 ## Current non-goals
 
 - No provider abstraction, generic app server, compatibility layer, approval
   subsystem, or alternate agent runtime.
-- No audio implementation work.
-- No new `.service(...)` transport design without a concrete consumer.
-- No cosmetic CLI/TUI lifecycle rewrite when existing behavior is accepted.
-- No VM, browser, managed-agent, proxy, or experimental-crate work.
-- No benchmark, task, or verifier modification made solely to improve an eval
-  score.
+- No Harbor-owned execution path; Harbor remains a compatible record and ATIF
+  boundary.
+- No benchmark, task, or verifier modification made to improve an eval score.
+- No claim that saturated wall time is uncontended per-agent latency.
+- No generic multi-agent scheduler in the stable agent crates.
+- No browser, managed-agent, or Tempo-specific dependency in public
+  `nanocodex-*` crates as part of this evaluation slice.

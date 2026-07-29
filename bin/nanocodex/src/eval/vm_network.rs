@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex_vm::Gvproxy as GvproxyProcess;
+use nanocodex_vm::host::{Gvproxy as GvproxyProcess, GvproxyError as VmGvproxyError};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -34,7 +34,7 @@ pub(crate) enum GvproxyError {
     },
 
     #[error(transparent)]
-    Process(#[from] nanocodex_vm::GvproxyError),
+    Process(#[from] VmGvproxyError),
 
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -58,7 +58,7 @@ impl Gvproxy {
     fn spawn_with(
         binary: &Path,
         log: &Path,
-        spawn: impl FnOnce(&Path, &Path, &Path) -> Result<GvproxyProcess, nanocodex_vm::GvproxyError>,
+        spawn: impl FnOnce(&Path, &Path, &Path) -> Result<GvproxyProcess, VmGvproxyError>,
     ) -> Result<Self, GvproxyError> {
         let directory = tempfile::Builder::new()
             .prefix("nanocodex-eval-gvproxy-")

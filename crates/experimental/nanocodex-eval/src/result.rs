@@ -1,9 +1,7 @@
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 use chrono::{DateTime, Utc};
-use nanocodex_oai_api::{
-    events::RuntimeCompleteness as EventRuntimeCompleteness, pricing::EstimatedUsdCost,
-};
+use nanocodex_oai_api::pricing::EstimatedUsdCost;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -676,9 +674,6 @@ pub struct AgentMetadata {
     pub cost_usd: Option<f64>,
     /// Stable explanation of whether cost is available.
     pub cost_status: String,
-    /// Built-in pricing catalog revision used for the estimate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pricing_revision: Option<String>,
     /// Exact aggregate estimate and input/cache/output composition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<EstimatedUsdCost>,
@@ -694,7 +689,7 @@ struct AgentMetadataWire {
     transport: String,
     orchestration: String,
     #[serde(default)]
-    runtime_completeness: Option<EventRuntimeCompleteness>,
+    runtime_completeness: Option<MeasurementCompleteness>,
     duration_ms: u64,
     duration_ns: u64,
     model_calls: u32,
@@ -720,8 +715,6 @@ struct AgentMetadataWire {
     cost_usd: Option<f64>,
     cost_status: String,
     #[serde(default)]
-    pricing_revision: Option<String>,
-    #[serde(default)]
     estimated_cost: Option<EstimatedUsdCost>,
 }
 
@@ -730,7 +723,6 @@ impl From<AgentMetadataWire> for AgentMetadata {
         let runtime_completeness = if metadata.status == AgentStatus::Completed {
             metadata
                 .runtime_completeness
-                .map(MeasurementCompleteness::from)
                 .unwrap_or(MeasurementCompleteness::Complete)
         } else {
             MeasurementCompleteness::ObservedLowerBound
@@ -765,7 +757,6 @@ impl From<AgentMetadataWire> for AgentMetadata {
             _last_response_id: metadata.last_response_id,
             cost_usd: metadata.cost_usd,
             cost_status: metadata.cost_status,
-            pricing_revision: metadata.pricing_revision,
             estimated_cost: metadata.estimated_cost,
         }
     }
@@ -788,15 +779,6 @@ impl MeasurementCompleteness {
     #[must_use]
     pub const fn is_complete(&self) -> bool {
         matches!(self, Self::Complete)
-    }
-}
-
-impl From<EventRuntimeCompleteness> for MeasurementCompleteness {
-    fn from(completeness: EventRuntimeCompleteness) -> Self {
-        match completeness {
-            EventRuntimeCompleteness::Complete => Self::Complete,
-            EventRuntimeCompleteness::ObservedLowerBound => Self::ObservedLowerBound,
-        }
     }
 }
 

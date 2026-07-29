@@ -279,7 +279,6 @@ fn representative_attempt_facts() -> Vec<AttemptFact> {
                     runtime: None,
                     cost_usd: Some(0.05 + f64::from(repetition) / 100.0),
                     estimated_cost: None,
-                    pricing_revision: Some("benchmark-pricing-v1".to_owned()),
                     billing_completeness: Some(BillingCompleteness::Complete),
                     billing_snapshot_missing: false,
                     latency: LatencyBreakdown {
