@@ -4497,6 +4497,7 @@ dependencies = [
  "futures-util",
  "http",
  "nanocodex",
+ "nanocodex-eval",
  "nanocodex-vm",
  "reflink-copy",
  "reqwest",

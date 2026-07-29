@@ -16,6 +16,7 @@ eyre.workspace = true
 futures-util.workspace = true
 http.workspace = true
 nanocodex.workspace = true
+nanocodex-eval.workspace = true
 nanocodex-vm.workspace = true
 reqwest.workspace = true
 reflink-copy.workspace = true
